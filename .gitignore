@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# 运行时知识库：原始文档、解析缓存、索引与本地配置
+kb/

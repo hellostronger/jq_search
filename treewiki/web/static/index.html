@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TreeWiki</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --line: #e5e8ec; --text: #24292f;
+    --muted: #6a737d; --accent: #2563eb; --ok: #1a7f37; --err: #cf222e;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); }
+  header { background: var(--card); border-bottom: 1px solid var(--line); padding: 14px 24px; display: flex; align-items: baseline; gap: 12px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  main { max-width: 980px; margin: 20px auto; padding: 0 16px; display: grid; gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  .card h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); font-weight: 600; letter-spacing: .5px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input[type=text], input[type=password], select {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; background: #fff;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+  button {
+    padding: 8px 16px; border: none; border-radius: 6px; background: var(--accent); color: #fff;
+    font-size: 13px; cursor: pointer; margin-top: 12px;
+  }
+  button.secondary { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
+  button:disabled { opacity: .5; cursor: wait; }
+  .msg { font-size: 12px; margin-top: 10px; }
+  .msg.ok { color: var(--ok); } .msg.err { color: var(--err); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  .stages { font-size: 12px; color: var(--muted); background: #fafbfc; border: 1px solid var(--line);
+            border-radius: 6px; padding: 8px 10px; margin-top: 10px; max-height: 160px; overflow: auto; white-space: pre-wrap; }
+  .answer { border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; margin-top: 12px;
+            font-size: 14px; line-height: 1.7; white-space: pre-wrap; }
+  .cites { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .cites span { background: #eef4ff; color: var(--accent); border-radius: 4px; padding: 1px 7px; margin-right: 4px; }
+  details { margin-top: 10px; font-size: 12px; color: var(--muted); }
+  pre { background: #fafbfc; border: 1px solid var(--line); border-radius: 6px; padding: 10px; overflow: auto; max-height: 260px; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .row > * { flex: 1; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; background: #eef4ff; color: var(--accent); }
+  .desc { color: var(--muted); font-size: 12px; margin-top: 2px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>TreeWiki</h1>
+  <span class="sub">LLMWiki × PageIndex — M1：MinerU 解析 → 树索引 → 推理遍历问答</span>
+</header>
+<main>
+
+  <section class="card">
+    <h2>设置</h2>
+    <div class="grid">
+      <div>
+        <label>LLM Base URL（OpenAI 兼容）</label>
+        <input type="text" id="llm_base_url" placeholder="https://api.openai.com/v1">
+      </div>
+      <div>
+        <label>API Key</label>
+        <input type="password" id="llm_api_key" placeholder="sk-...">
+      </div>
+      <div>
+        <label>Index 模型（建树/摘要，用便宜的）</label>
+        <input type="text" id="llm_index_model" placeholder="gpt-4o-mini">
+      </div>
+      <div>
+        <label>Chat 模型（问答/遍历，用强的）</label>
+        <input type="text" id="llm_chat_model" placeholder="gpt-4o">
+      </div>
+    </div>
+    <div class="grid">
+      <div>
+        <label>MinerU Token（mineru.net）</label>
+        <input type="password" id="mineru_token" placeholder="eyJhbGci...">
+      </div>
+      <div>
+        <label>MinerU model_version</label>
+        <select id="mineru_model_version">
+          <option value="pipeline">pipeline（默认）</option>
+          <option value="vlm">vlm</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <button id="btn_save">保存配置</button>
+      <button class="secondary" id="btn_test">测试 LLM 连接</button>
+    </div>
+    <div class="msg" id="config_msg"></div>
+  </section>
+
+  <section class="card">
+    <h2>文档（摄取 → 建树）</h2>
+    <div class="row">
+      <input type="text" id="file_display" placeholder="选择文件…（md/txt 本地解析，其余走 MinerU）" disabled>
+      <input type="file" id="file_input" accept=".pdf,.doc,.docx,.html,.md,.markdown,.txt" style="flex:0 0 180px">
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input type="text" id="file_desc" maxlength="500" placeholder="补充描述（可选）：例如「v1.0 平台部署文档」">
+      <button id="btn_upload" style="flex:0 0 100px; margin-top:0">上传并建树</button>
+    </div>
+    <div class="stages" id="ingest_stages" style="display:none"></div>
+    <table id="sources_table" style="margin-top:12px">
+      <thead><tr><th>doc_id</th><th>文件</th><th>页数</th><th>节点</th><th>状态</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <details id="tree_details"><summary>查看选中文档的树索引</summary><pre id="tree_skeleton"></pre></details>
+  </section>
+
+  <section class="card">
+    <h2>问答（树遍历检索）</h2>
+    <div class="row">
+      <select id="query_doc"></select>
+      <button id="btn_query" style="flex:0 0 90px">提问</button>
+    </div>
+    <label>问题</label>
+    <input type="text" id="query_text" placeholder="例如：Q1 的总收入是多少？">
+    <div id="query_result" style="display:none">
+      <div class="answer" id="answer"></div>
+      <div class="cites" id="cites"></div>
+      <details><summary>定位轨迹（rounds / 读取页）</summary><pre id="trace"></pre></details>
+    </div>
+    <div class="msg" id="query_msg"></div>
+  </section>
+
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => (s ?? "").toString().replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || r.status + " " + r.statusText);
+  return data;
+}
+
+function setMsg(id, text, ok) {
+  const el = $(id);
+  el.textContent = text || "";
+  el.className = "msg " + (ok ? "ok" : text ? "err" : "");
+}
+
+async function loadConfig() {
+  try {
+    const {config} = await api("/api/config");
+    $("llm_base_url").value = config.llm.base_url || "";
+    $("llm_api_key").value = config.llm.api_key || "";
+    $("llm_index_model").value = config.llm.index_model || "";
+    $("llm_chat_model").value = config.llm.chat_model || "";
+    $("mineru_token").value = config.mineru.token || "";
+    $("mineru_model_version").value = config.mineru.model_version || "pipeline";
+  } catch (e) { setMsg("config_msg", "读取配置失败：" + e.message); }
+}
+
+async function saveConfig() {
+  const payload = {llm: {
+    base_url: $("llm_base_url").value.trim(),
+    api_key: $("llm_api_key").value.trim(),
+    index_model: $("llm_index_model").value.trim(),
+    chat_model: $("llm_chat_model").value.trim(),
+  }, mineru: {
+    token: $("mineru_token").value.trim(),
+    model_version: $("mineru_model_version").value,
+  }};
+  try {
+    await api("/api/config", {method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+    setMsg("config_msg", "已保存到 kb/config.yaml", true);
+  } catch (e) { setMsg("config_msg", "保存失败：" + e.message); }
+}
+
+async function testLLM() {
+  const btn = $("btn_test"); btn.disabled = true; setMsg("config_msg", "测试中…");
+  try {
+    const r = await api("/api/test-llm", {method: "POST"});
+    if (r.ok) setMsg("config_msg", `LLM 连通（${r.elapsed}s）：${r.reply}`, true);
+    else setMsg("config_msg", "LLM 不通：" + r.error);
+  } catch (e) { setMsg("config_msg", "请求失败：" + e.message); }
+  btn.disabled = false;
+}
+
+async function loadSources() {
+  try {
+    const {sources} = await api("/api/sources");
+    const tbody = $("sources_table").querySelector("tbody");
+    tbody.innerHTML = sources.map(s =>
+      `<tr><td>${esc(s.doc_id)}</td>` +
+      `<td>${esc(s.name)}${s.description ? '<div class="desc">' + esc(s.description) + '</div>' : ""}</td>` +
+      `<td>${s.pages}</td><td>${s.nodes || 0}</td><td><span class="badge">${esc(s.status)}</span></td></tr>`).join("")
+      || '<tr><td colspan="5" style="color:var(--muted)">暂无来源，上传一个文档开始</td></tr>';
+    const sel = $("query_doc");
+    const prev = sel.value;
+    sel.innerHTML = sources.map(s => `<option value="${esc(s.doc_id)}">${esc(s.doc_id)} — ${esc(s.name)}</option>`).join("");
+    if (prev && sources.some(s => s.doc_id === prev)) sel.value = prev;
+  } catch (e) { console.error(e); }
+}
+
+let pollTimer = null;
+async function upload() {
+  const f = $("file_input").files[0];
+  if (!f) { setMsg("ingest_msg", "先选择文件"); return; }
+  const btn = $("btn_upload"); btn.disabled = true;
+  const stages = $("ingest_stages"); stages.style.display = "block"; stages.textContent = "上传中…";
+  try {
+    const fd = new FormData(); fd.append("file", f);
+    fd.append("description", $("file_desc").value.trim());
+    const {job_id} = await api("/api/ingest", {method: "POST", body: fd});
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(async () => {
+      try {
+        const job = await api("/api/jobs/" + job_id);
+        stages.textContent = job.stages.join("\n");
+        if (job.status === "done") {
+          clearInterval(pollTimer);
+          stages.textContent += `\n✅ 完成 doc_id=${job.doc_id}`;
+          await loadSources();
+        } else if (job.status === "error") {
+          clearInterval(pollTimer);
+          stages.textContent += `\n❌ 失败：${job.error}`;
+        }
+      } catch (e) { clearInterval(pollTimer); stages.textContent += "\n轮询失败：" + e.message; }
+    }, 2500);
+  } catch (e) {
+    stages.textContent += "\n❌ " + e.message;
+  }
+  btn.disabled = false;
+}
+
+async function showTree(docId) {
+  if (!docId) return;
+  try {
+    const {skeleton} = await api("/api/skeleton/" + docId);
+    $("tree_skeleton").textContent = skeleton;
+  } catch (e) { $("tree_skeleton").textContent = e.message; }
+}
+
+async function runQuery() {
+  const docId = $("query_doc").value, q = $("query_text").value.trim();
+  if (!docId) { setMsg("query_msg", "没有可选文档"); return; }
+  if (!q) { setMsg("query_msg", "请输入问题"); return; }
+  const btn = $("btn_query"); btn.disabled = true;
+  setMsg("query_msg", "树遍历检索中…（多轮定位，可能需要几十秒）");
+  $("query_result").style.display = "none";
+  try {
+    const r = await api("/api/query", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({doc_id: docId, question: q, mode: "raw"})});
+    $("query_result").style.display = "block";
+    $("answer").textContent = r.answer || "（无答案）";
+    const pages = (r.citations[0] && r.citations[0].pages) || [];
+    $("cites").innerHTML = "引用页：" + (pages.length ? pages.map(p => `<span>p${p}</span>`).join("") : "无");
+    $("trace").textContent = JSON.stringify(
+      {rounds: r.rounds, read_nodes: r.read_nodes, read_pages: r.read_pages, usage: r.usage}, null, 2);
+    setMsg("query_msg", "");
+  } catch (e) { setMsg("query_msg", "失败：" + e.message); }
+  btn.disabled = false;
+}
+
+$("btn_save").onclick = saveConfig;
+$("btn_test").onclick = testLLM;
+$("btn_upload").onclick = upload;
+$("btn_query").onclick = runQuery;
+$("file_input").onchange = () => { $("file_display").value = $("file_input").files[0]?.name || ""; };
+$("query_doc").onchange = () => showTree($("query_doc").value);
+$("tree_details").onclick = () => showTree($("query_doc").value);
+
+loadConfig();
+loadSources();
+</script>
+</body>
+</html>

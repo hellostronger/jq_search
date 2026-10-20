@@ -31,6 +31,9 @@ DEFAULTS: dict[str, Any] = {
         "max_rounds": 4,
         "max_pages": 30,
         "page_chars": 3500,
+        "locate_retries": 1,
+        "answer_attempts": 3,
+        "summary_chars": 6000,
     },
 }
 

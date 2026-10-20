@@ -83,7 +83,7 @@ def ingest_file(
     assign_ids(structure)
 
     if cfg["index"]["summaries"]:
-        add_summaries(
+        report = add_summaries(
             structure,
             pages,
             llm,
@@ -91,7 +91,12 @@ def ingest_file(
             workers=cfg["index"]["summary_workers"],
             stage=stage,
         )
+        failed = len(report["leaf_failures"]) + len(report["rollup_failures"])
+        if failed:
+            stage(f"[{doc_id}] ⚠ 摘要失败 {failed} 个节点（已重试，详见上方清单）")
     desc = describe_doc(pages, structure, llm, cfg["llm"]["index_model"], hint=description)
+    if not desc:
+        stage(f"[{doc_id}] ⚠ 文档描述为空（已重试），检索时将缺少全局概览")
 
     tree = TreeDoc(
         doc_id=doc_id,

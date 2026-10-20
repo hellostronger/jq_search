@@ -198,6 +198,14 @@ def coerce_nodes(raw: Any, total_pages: int) -> list[Node]:
 
 # ---------------------------------------------------------------- 摘要与描述
 
+def _fallback_rollup(n: Node) -> str:
+    parts = []
+    for ch in n.nodes:
+        text = _truncate(ch.summary, 160)
+        parts.append(f"{ch.title}：{text}" if text else ch.title)
+    return _truncate("；".join(parts), 1200)
+
+
 def add_summaries(
     structure: list[Node],
     pages: list[str],
@@ -205,14 +213,18 @@ def add_summaries(
     model: str,
     workers: int = 6,
     stage: Callable[[str], None] | None = None,
-) -> None:
+    retries: int = 1,
+) -> dict[str, Any]:
+    """生成叶摘要与父节点摘要。失败会重试并返回失败清单，不静默留空。"""
+    report: dict[str, Any] = {"leaves": 0, "leaf_failures": [], "rollup_failures": []}
     leaves = [n for n, _ in iter_nodes(structure) if not n.nodes]
+    report["leaves"] = len(leaves)
     if not leaves:
-        return
+        return report
     if stage:
         stage(f"生成 {len(leaves)} 个叶节点摘要 …")
 
-    def one(n: Node) -> None:
+    def one(n: Node) -> dict | None:
         body = "\n\n".join(
             f"【第 {i} 页】\n{_truncate(pages[i - 1], 2500)}"
             for i in range(n.start_index, n.end_index + 1)
@@ -220,61 +232,109 @@ def add_summaries(
         )
         if not body.strip():
             n.summary = ""
-            return
-        try:
-            data = llm.chat_json(
-                [
-                    {"role": "system", "content": SUMMARY_SYS},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"节点「{n.title}」（第 {n.start_index}-{n.end_index} 页）内容：\n{body}\n\n"
-                            "用 3-6 条要点总结该节的关键事实与数据（保留数字、名称等具体信息）。"
-                            "输出 JSON：{\"summary\":\"...\"}"
-                        ),
-                    },
-                ],
-                model=model,
-                max_tokens=900,
-            )
-            n.summary = str(data.get("summary", ""))[:2000]
-        except Exception:
-            n.summary = ""
+            return None
+        messages = [
+            {"role": "system", "content": SUMMARY_SYS},
+            {
+                "role": "user",
+                "content": (
+                    f"节点「{n.title}」（第 {n.start_index}-{n.end_index} 页）内容：\n{body}\n\n"
+                    "用 3-6 条要点总结该节的关键事实与数据（保留数字、名称等具体信息）。"
+                    "输出 JSON：{\"summary\":\"...\"}"
+                ),
+            },
+        ]
+        last_error = ""
+        for attempt in range(retries + 1):
+            try:
+                data = llm.chat_json(messages, model=model, max_tokens=900)
+                summary = str(data.get("summary", "") or "").strip()[:2000]
+                if summary:
+                    n.summary = summary
+                    return None
+                last_error = "摘要为空"
+            except Exception as exc:
+                last_error = str(exc)
+            if attempt < retries:
+                messages = messages + [
+                    {"role": "user", "content": "上一次没有给出有效的 summary。请重新输出 JSON。"}
+                ]
+        n.summary = ""
+        return {
+            "id": n.node_id,
+            "title": n.title,
+            "pages": [n.start_index, n.end_index],
+            "error": last_error,
+        }
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        list(ex.map(one, leaves))
+        failures = list(ex.map(one, leaves))
+    report["leaf_failures"] = [f for f in failures if f]
+    if stage and report["leaf_failures"]:
+        ids = ", ".join(f["id"] for f in report["leaf_failures"][:8])
+        stage(f"⚠ {len(report['leaf_failures'])} 个叶节点摘要失败（{ids}）")
+
+    rollup_failures: list[dict] = []
 
     def rollup(n: Node) -> None:
         if not n.nodes:
             return
         for ch in n.nodes:
             rollup(ch)
-        parts = [f"- {ch.title}: {_truncate(ch.summary, 300) or '（无摘要）'}" for ch in n.nodes]
-        try:
-            data = llm.chat_json(
-                [
-                    {"role": "system", "content": SUMMARY_SYS},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"父节点「{n.title}」的子节点摘要：\n" + "\n".join(parts) +
-                            "\n\n用 2-4 句话概括该节点。输出 JSON：{\"summary\":\"...\"}"
-                        ),
-                    },
-                ],
-                model=model,
-                max_tokens=600,
-            )
-            n.summary = str(data.get("summary", ""))[:1200]
-        except Exception:
-            n.summary = ""
+        parts = [
+            f"- {ch.title}: {_truncate(ch.summary, 300) or '（无摘要）'}"
+            for ch in n.nodes
+        ]
+        messages = [
+            {"role": "system", "content": SUMMARY_SYS},
+            {
+                "role": "user",
+                "content": (
+                    f"父节点「{n.title}」的子节点摘要：\n" + "\n".join(parts) +
+                    "\n\n用 2-4 句话概括该节点。输出 JSON：{\"summary\":\"...\"}"
+                ),
+            },
+        ]
+        last_error = ""
+        for attempt in range(retries + 1):
+            try:
+                data = llm.chat_json(messages, model=model, max_tokens=600)
+                summary = str(data.get("summary", "") or "").strip()[:1200]
+                if summary:
+                    n.summary = summary
+                    return
+                last_error = "摘要为空"
+            except Exception as exc:
+                last_error = str(exc)
+            if attempt < retries:
+                messages = messages + [
+                    {"role": "user", "content": "上一次没有给出有效的 summary。请重新输出 JSON。"}
+                ]
+        n.summary = _fallback_rollup(n)
+        rollup_failures.append(
+            {
+                "id": n.node_id,
+                "title": n.title,
+                "error": last_error,
+                "fallback": True,
+            }
+        )
 
     for top in structure:
         rollup(top)
+    report["rollup_failures"] = rollup_failures
+    if stage and report["rollup_failures"]:
+        stage(f"⚠ {len(report['rollup_failures'])} 个父节点摘要失败（已用子标题兜底）")
+    return report
 
 
 def describe_doc(
-    pages: list[str], structure: list[Node], llm: Any, model: str, hint: str = ""
+    pages: list[str],
+    structure: list[Node],
+    llm: Any,
+    model: str,
+    hint: str = "",
+    retries: int = 1,
 ) -> str:
     head = "\n\n".join(
         f"【第 {i} 页】\n{_truncate(pages[i - 1], 1500)}"
@@ -282,24 +342,29 @@ def describe_doc(
     )
     skel = skeleton_text(structure, max_chars=3000)
     extra = f"用户补充说明：{hint}\n\n" if hint else ""
-    try:
-        data = llm.chat_json(
-            [
-                {"role": "system", "content": SUMMARY_SYS},
-                {
-                    "role": "user",
-                    "content": (
-                        f"{extra}文档开头：\n{head}\n\n目录：\n{skel}\n\n"
-                        "用 1-3 句话描述该文档的主题与内容。输出 JSON：{\"description\":\"...\"}"
-                    ),
-                },
-            ],
-            model=model,
-            max_tokens=300,
-        )
-        return str(data.get("description", ""))[:800]
-    except Exception:
-        return ""
+    messages = [
+        {"role": "system", "content": SUMMARY_SYS},
+        {
+            "role": "user",
+            "content": (
+                f"{extra}文档开头：\n{head}\n\n目录：\n{skel}\n\n"
+                "用 1-3 句话描述该文档的主题与内容。输出 JSON：{\"description\":\"...\"}"
+            ),
+        },
+    ]
+    for attempt in range(retries + 1):
+        try:
+            data = llm.chat_json(messages, model=model, max_tokens=300)
+            desc = str(data.get("description", "") or "").strip()[:800]
+            if desc:
+                return desc
+        except Exception:
+            pass
+        if attempt < retries:
+            messages = messages + [
+                {"role": "user", "content": "上一次没有给出有效的 description。请重新输出 JSON。"}
+            ]
+    return ""
 
 
 # ---------------------------------------------------------------- 渲染工具

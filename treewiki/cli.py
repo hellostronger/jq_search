@@ -102,7 +102,8 @@ def evalset(
         f"[green]写出 {len(ds['items'])} 条 → {out}[/green]  "
         f"文章 {ds['articles']} / 页 {ds['pages']} / 事实候选 {ds['candidate_facts']} "
         f"(A {ds['candidate_a']} · B {ds['candidate_b']} · S {ds['candidate_s']}) "
-        f"时序 {ds['candidate_timeline']} 未收录 {ds['candidate_absent']}"
+        f"时序 {ds['candidate_timeline']} 未收录 {ds['candidate_absent']} "
+        f"重复并入 {ds['candidate_duplicate_gold']} · 冲突剔除 {ds['candidate_duplicate_conflict']}"
     )
 
 

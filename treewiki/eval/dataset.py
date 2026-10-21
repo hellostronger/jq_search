@@ -206,7 +206,8 @@ def _paraphrase(q: str) -> str | None:
 
 def _figures(sent: str, m: re.Match) -> list[str]:
     core = re.findall(r"\d[\d,，.]*", m.group(0))
-    return [c for c in dict.fromkeys(core) if len(re.sub(r"\D", "", c)) >= 2][:2]
+    unit = bool(re.search(r"[%％元亿万美元倍]", m.group(0)))
+    return [c for c in dict.fromkeys(core) if len(re.sub(r"\D", "", c)) >= 2 or unit][:2]
 
 
 def build_factual_items(arts: list[Article], rng: random.Random) -> list[dict]:
@@ -302,6 +303,69 @@ def classify_by_lexicon(items: list[dict], lows: list[str]) -> None:
         # 原句题的说法必然逐字来自语料；一片刻都找不到说明抽出来的分句是残句
         broken_literal = it.get("kind") == "literal" and it["key_pages"] == 0
         it["ambiguous"] = (not key) or it["key_pages"] > 2 or broken_literal
+
+
+_VALUE = re.compile(r"[+\-]?\d[\d,，.]*\s*(?:%|％|万亿|亿|万|元|美元|港元|倍)?")
+_SENT_SPLIT = re.compile(r"[。；;！？\n]")
+
+
+def _norm_value(v: str) -> str:
+    return re.sub(r"[,，.．\s]", "", v or "").lower()
+
+
+def _left_context(answer: str, figure: str) -> str:
+    """取标准答案里数字前面的那半句，用它去别处找同一个问法。"""
+    idx = answer.find(figure)
+    if idx < 0:
+        return ""
+    return _SENT_SPLIT.split(answer[max(0, idx - 48) : idx])[-1].strip()
+
+
+def expand_duplicate_gold(items: list[dict], lows: list[str]) -> tuple[int, int]:
+    """同一个问法在语料别处出现：数值一致就把那页并入 gold，数值冲突说明问题不唯一。
+
+    公众号每天复述同一批行情，同一句话常带不同数字出现在不同日期；不处理的话，
+    答对另一天的正确数字也会被判错。冲突题直接剔除，不给评测留模棱两可的标准。
+    """
+    expanded = conflicted = 0
+    for it in items:
+        figs = it.get("gold_figures") or []
+        left = _left_context(it.get("gold_answer") or "", figs[0]) if figs else ""
+        if len(left) < 6:
+            continue
+        probe = left.lower()
+        gold = {_norm_value(f) for f in figs}
+        same: set[int] = set()
+        diff: set[int] = set()
+        for i, low in enumerate(lows, start=1):
+            start = 0
+            while True:
+                j = low.find(probe, start)
+                if j < 0:
+                    break
+                tail = low[j + len(probe) : j + len(probe) + 20].lstrip()
+                m = _VALUE.match(tail)
+                if m:
+                    value = _norm_value(m.group(0))
+                    if any(g and (g in value or value in g) for g in gold):
+                        same.add(i)
+                    else:
+                        diff.add(i)
+                start = j + 1
+        span = it.get("gold_span") or []
+        inside = lambda p: len(span) == 2 and span[0] <= p <= span[1]
+        same = {p for p in same if not inside(p)}
+        diff = {p for p in diff if not inside(p)}
+        if diff:
+            it["ambiguous"] = True
+            it["conflict_pages"] = sorted(diff)[:5]
+            conflicted += 1
+            continue
+        if same:
+            it["gold_pages"] = sorted(set(it["gold_pages"]) | same)
+            it["gold_spans"] = ([span] if span else []) + [[p, p] for p in sorted(same)]
+            expanded += 1
+    return expanded, conflicted
 
 
 _GENERIC_TERMS = {
@@ -468,6 +532,7 @@ def build_dataset(
     arts = split_articles(pages)
     facts = build_factual_items(arts, rng)
     classify_by_lexicon(facts, lows)
+    expanded, conflicted = expand_duplicate_gold(facts, lows)
     dropped = sum(1 for i in facts if i["ambiguous"])
     facts = [i for i in facts if not i["ambiguous"]]
     timeline = build_timeline_items(arts)
@@ -487,6 +552,8 @@ def build_dataset(
         "joined_chars": len(joined),
         "candidate_facts": len(facts),
         "candidate_ambiguous": dropped,
+        "candidate_duplicate_gold": expanded,
+        "candidate_duplicate_conflict": conflicted,
         "candidate_a": sum(1 for i in facts if i["tier"] == "A"),
         "candidate_b": sum(1 for i in facts if i["tier"] == "B"),
         "candidate_s": sum(1 for i in facts if i["tier"] == "S"),

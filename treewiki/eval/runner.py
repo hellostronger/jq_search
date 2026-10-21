@@ -52,7 +52,8 @@ def grade(item: dict, result: dict, lows: list[str] | None = None) -> dict:
     page_hit = bool(gold & got)
     near_hit = bool(gold & {p + d for p in gold for d in (-1, 0, 1)} & got)
     span = item.get("gold_span") or []
-    article_hit = bool(span) and any(span[0] <= p <= span[1] for p in got)
+    spans = item.get("gold_spans") or ([span] if span else [])
+    article_hit = any(a <= p <= b for a, b in spans for p in got)
     # 引用页原文里确实出现这个数字，说明引用撑得住，即使不是 gold 那一页
     verifiable = bool(lows) and bool(figures) and any(
         all(_norm(f) in _norm(lows[p - 1]) for f in figures) for p in got if 0 < p <= len(lows)

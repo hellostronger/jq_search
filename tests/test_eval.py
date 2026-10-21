@@ -3,10 +3,13 @@ import random
 from treewiki.eval.dataset import (
     Article,
     _cloze,
+    _figures,
     _longest_run,
     _MONEY,
+    _PCT,
     _paraphrase,
     classify_by_lexicon,
+    expand_duplicate_gold,
     quota,
     split_articles,
 )
@@ -202,3 +205,62 @@ def test_ngram_segmentation_recovers_a_gold_page_that_and_over_clause_terms_miss
 
     assert _pages_with(lows, anchor_terms(q), "and", 12) != [1]
     assert _pages_with(lows, _ngram_terms(q), "and", 12) == [1]
+
+
+def test_figures_keeps_single_digit_percentages():
+    sent = "油价盘中涨幅一度超过5%，随后回落。"
+    assert _figures(sent, _PCT.search(sent)) == ["5"]
+
+
+def _dup_item(**kw):
+    base = {
+        "id": "x",
+        "tier": "A",
+        "kind": "literal",
+        "question": "德国DAX指数均涨多少？",
+        "gold_pages": [2],
+        "gold_span": [2, 2],
+        "gold_answer": "欧洲主要股指集体上涨，德国DAX指数均涨1.4%，法国CAC40指数涨1.1%。",
+        "gold_figures": ["1.4"],
+    }
+    base.update(kw)
+    return base
+
+
+def test_duplicate_fact_on_another_page_joins_the_gold_set():
+    lows = [
+        "无关页面",
+        "欧洲主要股指集体上涨，德国DAX指数均涨1.4%，法国CAC40指数涨1.1%。",
+        "美股收涨，欧洲主要股指集体上涨，德国DAX指数均涨1.4%。",
+    ]
+    items = [_dup_item()]
+    expanded, conflicted = expand_duplicate_gold(items, [t.lower() for t in lows])
+    assert (expanded, conflicted) == (1, 0)
+    assert items[0]["gold_pages"] == [2, 3]
+    assert items[0]["gold_spans"] == [[2, 2], [3, 3]]
+
+
+def test_same_wording_with_a_different_number_is_dropped_as_ambiguous():
+    lows = [
+        "无关页面",
+        "欧洲主要股指集体上涨，德国DAX指数均涨1.4%。",
+        "欧洲主要股指集体上涨，德国DAX指数均涨2.2%。",
+    ]
+    items = [_dup_item()]
+    expanded, conflicted = expand_duplicate_gold(items, [t.lower() for t in lows])
+    assert (expanded, conflicted) == (0, 1)
+    assert items[0]["ambiguous"] is True
+
+
+def test_grade_credits_any_of_multiple_gold_pages():
+    item = {
+        "id": "1",
+        "tier": "A",
+        "question": "q",
+        "gold_pages": [2, 9],
+        "gold_span": [2, 2],
+        "gold_spans": [[2, 2], [9, 9]],
+        "gold_figures": ["1.4"],
+    }
+    alt = {"answer": "均涨 1.4%", "citations": [{"doc_id": "d", "pages": [9]}]}
+    assert grade(item, alt)["ok"] is True

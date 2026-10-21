@@ -360,6 +360,24 @@ def test_refine_merges_same_value_reports_from_different_pages():
     assert out[0]["gold_spans"] == [[10, 11], [20, 20]]
 
 
+def test_refine_drops_question_that_lost_its_subject():
+    items = [
+        {
+            "id": "1", "kind": "literal", "tier": "S", "question": "总市值突破多少？",
+            "gold_pages": [1], "gold_answer": "涨停板上封单超31万手，总市值突破200亿元。",
+            "gold_figures": ["200"],
+        },
+        {
+            "id": "2", "kind": "literal", "tier": "A", "question": "万达商管2025年营收多少？",
+            "gold_pages": [2], "gold_answer": "万达商管2025年营收284.9亿元。",
+            "gold_figures": ["284.9"],
+        },
+    ]
+    out, stats = refine_questions(items)
+    assert stats["underspecified"] == 1
+    assert [i["id"] for i in out] == ["2"]
+
+
 def test_timeline_gold_articles_align_with_gold_spans():
     arts = [
         Article(aid="A0001", title="智元机器人：发布新品", date="2026-10-01", frags=[(40, "x")]),

@@ -105,7 +105,8 @@ def evalset(
         f"时序 {ds['candidate_timeline']} 未收录 {ds['candidate_absent']} "
         f"重复并入 {ds['candidate_duplicate_gold']} · 冲突剔除 {ds['candidate_duplicate_conflict']} "
         f"同问并入 {ds['candidate_merged']} · 同问冲突 {ds['candidate_multi_answer']} "
-        f"残句 {ds['candidate_bad_clause']} · 去重 {ds['candidate_deduped']}"
+        f"残句 {ds['candidate_bad_clause']} · 缺主体 {ds['candidate_underspecified']} "
+        f"· 去重 {ds['candidate_deduped']}"
     )
 
 

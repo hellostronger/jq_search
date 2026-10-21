@@ -381,10 +381,25 @@ def expand_duplicate_gold(items: list[dict], lows: list[str]) -> tuple[int, int]
 
 
 _CLEAN_TEXT = re.compile(r"[\s\-－—_：:，,。、|（）()『』“”\"'’]")
+_GENERIC_HEADS = (
+    "总市值", "总认缴规模", "售价", "分别", "营收", "净利润", "营业收入", "收入",
+    "利润", "规模", "价格", "市值", "估值", "金额", "销量", "出货量", "份额", "占比",
+    "成本", "费用", "利率", "收益率", "涨幅", "跌幅", "同比", "环比", "均价", "总价",
+)
+_UNDERSPEC_YEAR = re.compile(r"^20\d{2}年.*(?:分别|同比|环比)")
 
 
 def _norm_text(s: str) -> str:
     return _CLEAN_TEXT.sub("", s or "").lower()
+
+
+def _underspecified(question: str) -> bool:
+    """分句开头就是"总市值/售价/分别"这类通用词，问题没有可辨认的主体。"""
+    q = question.rstrip("？?")
+    left = q[:-2] if q.endswith("多少") else q
+    if len(left) > 16:
+        return False
+    return left.startswith(_GENERIC_HEADS) or bool(_UNDERSPEC_YEAR.match(left))
 
 
 def refine_questions(items: list[dict]) -> tuple[list[dict], dict[str, int]]:
@@ -395,8 +410,11 @@ def refine_questions(items: list[dict]) -> tuple[list[dict], dict[str, int]]:
     数值冲突才剔除（问法里丢了主体，答案不唯一）。
     """
     kept = []
-    bad_clause = 0
+    bad_clause = underspec = 0
     for it in items:
+        if _underspecified(it["question"]):
+            underspec += 1
+            continue
         if it["kind"] == "literal":
             q = it["question"].rstrip("？?")
             left = q[:-2] if q.endswith("多少") else ""
@@ -432,6 +450,7 @@ def refine_questions(items: list[dict]) -> tuple[list[dict], dict[str, int]]:
         out.append(base)
     return out, {
         "bad_clause": bad_clause,
+        "underspecified": underspec,
         "multi_conflict": multi,
         "merged": merged,
         "deduped": deduped,
@@ -626,6 +645,7 @@ def build_dataset(
         "candidate_duplicate_gold": expanded,
         "candidate_duplicate_conflict": conflicted,
         "candidate_bad_clause": refine["bad_clause"],
+        "candidate_underspecified": refine["underspecified"],
         "candidate_multi_answer": refine["multi_conflict"],
         "candidate_merged": refine["merged"],
         "candidate_deduped": refine["deduped"],

@@ -26,7 +26,7 @@ from ..pipelines.query import (
 from .dataset import read_jsonl, write_jsonl
 
 _REFUSE = re.compile(
-    r"(未提及|未收录|未明确|未给出|未披露|未出现|未找到|未见|不包含|没有.*找到|没有.*相关"
+    r"(未提及|未收录|未明确|未给出|未披露|未出现|未找到|未见|未包含|不包含|没有.*找到|没有.*相关"
     r"|找不到|证据不足|无法回答|文档中没)"
 )
 _NUM = re.compile(r"\d[\d,，.]*")
@@ -88,7 +88,7 @@ def grade(item: dict, result: dict, lows: list[str] | None = None) -> dict:
         "figure_hit": len(hit_all),
         "figure_total": len(figures),
         "refused": refused,
-        "grader": 2,
+        "grader": 3,
         "gold_pages": sorted(gold),
         "cited_pages": sorted(got),
         "read_pages": result.get("read_pages") or [],
@@ -316,7 +316,7 @@ def kb_home_of(home: Path | None) -> Path:
 
 def _regrade(row: dict) -> dict:
     """旧结果文件按新口径回填两个派生标记：诚实拒答允许顺带引用邻近页。"""
-    if row.get("grader") == 2:
+    if row.get("grader", 0) >= 3:
         return row
     refused = bool(_REFUSE.search(row.get("answer_head") or ""))
     grounded = row["page_hit"] or row.get("article_hit") or row.get("citation_verifiable")
@@ -386,6 +386,8 @@ def _cause(row: dict) -> str:
     row = _regrade(row)
     if row.get("error"):
         return "调用失败（429 / 超时）"
+    if not (row.get("answer_head") or "").strip():
+        return "空回答"
     lex = set((row.get("lexical") or {}).get("pages") or [])
     gold = set(row.get("gold_pages") or [])
     read = set(row.get("read_pages") or [])

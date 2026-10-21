@@ -10,7 +10,9 @@ from treewiki.eval.dataset import (
     _MONEY,
     _PCT,
     _paraphrase,
+    _underspecified,
     classify_by_lexicon,
+    build_factual_items,
     build_timeline_items,
     expand_duplicate_gold,
     refine_questions,
@@ -302,7 +304,7 @@ def test_refine_drops_literal_clause_that_is_not_in_its_answer():
             "id": "1",
             "kind": "literal",
             "tier": "S",
-            "question": "中国高校培养了：美国为多少？",
+            "question": "中国高校培养了美国多少？",
             "gold_pages": [1],
             "gold_answer": "2022 年时，美国为 46%，中国为 27%。",
         },
@@ -388,3 +390,74 @@ def test_timeline_gold_articles_align_with_gold_spans():
     it = next(i for i in items if i["entity"] == "智元机器人")
     assert it["gold_articles"] == ["A0001", "A0002", "A0003"]
     assert it["gold_spans"] == [[40, 40], [30, 30], [50, 50]]
+
+
+def test_underspecified_catches_relative_and_deictic_heads():
+    bad = [
+        "较冲突爆发前的1710万桶下降多少？",
+        "相较该合约今年5月中旬超过多少？",
+        "则提出未来3至5年数据中心AI业务营收增长多少？",
+        "刚结束的2026财年营收同比增长多少？",
+        "配售价较前一交易日收市价折让多少？",
+        "业绩变动主要系2026年1—9月公司营收同比增长多少？",
+        "2028财年营收同比增长多少？",
+        "2028年度及2029年度实际实现的净利润分别不低于多少？",
+        "占全市住房总成交比重突破多少？",
+        "相关内容还提到一期规划年产AI服务器多少？",
+        "客户转换成本极高：动态PE大约多少？",
+        "就有一块是它造的——份额多少？",
+        "美联储10月加息的概率从公布前的多少？",
+    ]
+    for q in bad:
+        assert _underspecified(q), q
+    good = [
+        "壁仞科技配售价较前一交易日收市价折让多少？",
+        "贵州茅台2026年三季度净利润多少？",
+        "比亚迪9月销量多少？",
+    ]
+    for q in good:
+        assert not _underspecified(q), q
+
+
+def test_refine_drops_para_question_that_became_deictic():
+    items = [
+        {
+            "id": "1", "kind": "para", "tier": "B",
+            "question": "则提出未来3至5年数据中心AI业务营收增长多少？",
+            "gold_pages": [1],
+            "gold_answer": "AMD则提出未来3至5年数据中心AI业务营收增长80%的目标。",
+            "gold_figures": ["80"],
+        },
+    ]
+    out, stats = refine_questions(items)
+    assert out == [] and stats["underspecified"] == 1
+
+
+def test_timeline_skips_unit_event_and_metric_fragments():
+    groups = ["同比下降", "万亿韩元", "被提起公诉", "分红率", "贵州茅台", "机器人"]
+    arts = []
+    n = 1
+    for term in groups:
+        for date in ("2026-10-01", "2026-10-02", "2026-10-03"):
+            arts.append(Article(aid=f"A{n:04d}", title=term, date=date, frags=[(n, "x")]))
+            n += 1
+    items = build_timeline_items(arts)
+    ents = {i["entity"] for i in items}
+    assert {"贵州茅台", "机器人"} <= ents
+    assert not ents & {"同比下降", "万亿韩元", "被提起公诉", "分红率"}
+
+
+def test_factual_items_take_three_sentences_per_article():
+    art = Article(
+        aid="A0001",
+        title="测试公司：业绩发布",
+        date="2026-10-15",
+        frags=[
+            (1, "测试公司2026年一季度营收达到100亿元。"),
+            (2, "测试公司2026年二季度营收达到200亿元。"),
+            (3, "测试公司2026年三季度营收达到300亿元。"),
+        ],
+    )
+    items = build_factual_items([art], random.Random(7))
+    literal = [i for i in items if i["kind"] == "literal"]
+    assert len(literal) == 3

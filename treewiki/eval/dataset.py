@@ -167,7 +167,7 @@ _DEICTIC = (
     "在", "为", "与", "和", "或", "及", "于", "按", "比", "是", "至", "到", "从",
     "对", "将", "被", "把", "让", "使", "给", "由", "当", "随着", "伴随", "相比",
 )
-_BAD_WORDS = ("一是", "二是", "三是", "例如", "比如", "一个是", "其中")
+_BAD_WORDS = ("一是", "二是", "三是", "例如", "比如", "一个是", "其中", "是否", "能否", "可否", "为什么", "如何")
 
 
 def _cloze(sent: str, m: re.Match, kind: str, art: Article) -> str | None:
@@ -210,7 +210,7 @@ def _figures(sent: str, m: re.Match) -> list[str]:
 
 
 def build_factual_items(arts: list[Article], rng: random.Random) -> list[dict]:
-    """每篇文章最多 2 个事实句，各产出一条字面题和一条改写题。"""
+    """每篇文章最多 3 个事实句，各产出一条字面题和一条改写题。"""
     items: list[dict] = []
     for art in arts:
         cands = []
@@ -227,7 +227,7 @@ def build_factual_items(arts: list[Article], rng: random.Random) -> list[dict]:
         picked = 0
         used_q = set()
         for page, sent, m, kind in cands:
-            if picked >= 2:
+            if picked >= 3:
                 break
             q = _cloze(sent, m, kind, art)
             if not q or q in used_q:
@@ -382,11 +382,19 @@ def expand_duplicate_gold(items: list[dict], lows: list[str]) -> tuple[int, int]
 
 _CLEAN_TEXT = re.compile(r"[\s\-－—_：:，,。、|（）()『』“”\"'’]")
 _GENERIC_HEADS = (
-    "总市值", "总认缴规模", "售价", "分别", "营收", "净利润", "营业收入", "收入",
-    "利润", "规模", "价格", "市值", "估值", "金额", "销量", "出货量", "份额", "占比",
-    "成本", "费用", "利率", "收益率", "涨幅", "跌幅", "同比", "环比", "均价", "总价",
+    "总市值", "总认缴规模", "售价", "配售价", "配对外", "分别", "营收", "净利润",
+    "营业收入", "收入", "利润", "规模", "价格", "市值", "估值", "金额", "销量",
+    "出货量", "份额", "占比", "评分", "店铺", "项目", "成本", "费用", "利率",
+    "收益率", "涨幅", "跌幅", "同比", "环比", "均价", "总价", "合计", "累计", "平均",
 )
-_UNDERSPEC_YEAR = re.compile(r"^20\d{2}年.*(?:分别|同比|环比)")
+# 以相对/指代/承接连词开头：主体在上文，单看问题无法定位是哪家公司、哪个指标
+_DEICTIC_HEADS = (
+    "较", "相较", "相比", "对比", "占", "则", "而", "但", "且", "并", "其", "该", "这",
+    "上述", "前述", "目前", "刚结束", "调整后", "该公司", "公司", "现有", "本次", "此次",
+    "虽然", "尽管", "业绩变动", "公告显示", "数据显示", "报告显示", "相关内容",
+    "报道称", "消息称", "据悉", "据了解", "就",
+)
+_UNDERSPEC_YEAR = re.compile(r"^20\d{2}(?:财)?年.*(?:分别|同比|环比|增长|下降|不低于)")
 
 
 def _norm_text(s: str) -> str:
@@ -394,12 +402,16 @@ def _norm_text(s: str) -> str:
 
 
 def _underspecified(question: str) -> bool:
-    """分句开头就是"总市值/售价/分别"这类通用词，问题没有可辨认的主体。"""
+    """问题左半句没有可辨认的主体：以通用指标词或相对/指代词开头都算。"""
+    if any(ch in question for ch in "：「」——"):
+        return True
+    if re.search(r"从[^？?]*的多少[？?]?$", question):
+        return True
     q = question.rstrip("？?")
     left = q[:-2] if q.endswith("多少") else q
-    if len(left) > 16:
-        return False
-    return left.startswith(_GENERIC_HEADS) or bool(_UNDERSPEC_YEAR.match(left))
+    if left.startswith(_DEICTIC_HEADS) or left.startswith(_GENERIC_HEADS):
+        return True
+    return bool(_UNDERSPEC_YEAR.match(left))
 
 
 def refine_questions(items: list[dict]) -> tuple[list[dict], dict[str, int]]:
@@ -460,6 +472,7 @@ def refine_questions(items: list[dict]) -> tuple[list[dict], dict[str, int]]:
 _GENERIC_TERMS = {
     "ai", "agent", "app", "apps", "llm", "api", "pc", "tv", "ip", "url", "web",
     "vs", "etf", "ipo", "ceo", "cpu", "gpu", "ic", "us", "uk", "eu", "a", "b", "2",
+    "token", "seed", "alpha",
 }
 # 中文标题里的通用词：不构成可追踪的事件实体
 _GENERIC_CJK = {
@@ -475,6 +488,16 @@ _EVENT_FRAGMENTS = (
     "集体", "个股", "曝光", "护城河", "受贿", "特别巨大", "很深", "速递", "午评",
     "晚会", "回应", "发声", "最新", "一度", "突破", "超过", "巨震", "拉升", "走弱",
     "走强", "回调", "翻倍", "腰斩", "破发", "新高", "新低", "创新高", "市值", "市值",
+    "同比", "环比", "下降", "增长", "上涨", "下跌", "下滑", "上升", "重挫", "暴跌",
+    "暴涨", "热搜", "提醒", "来了", "简历", "日记", "精选", "深夜", "关口", "到底",
+    "全市场", "封单", "概念", "利好", "紧急", "公告", "官宣", "重回", "多只", "休市",
+    "突发", "暴雨", "爆仓", "公诉", "诉讼", "辞职", "辞任", "死亡", "遇难", "失联",
+    "伤亡", "被查", "被", "股公司",
+)
+# 以金额/数量单位或"超"收尾的标题词是统计口径碎片，不是实体
+_TITLE_UNIT = re.compile(
+    r"(?:万亿|万|亿|千)(?:美元|港元|韩元|日元|欧元|元|股|人次)"
+    r"|(?:美元|港元|韩元|日元|欧元|元|股|人次|倍|率|额|量|润)$|超$"
 )
 
 
@@ -487,7 +510,7 @@ def _title_terms(art: Article) -> list[str]:
     for t in terms:
         if not t or t in _GENERIC_TERMS or len(t) < 3:
             continue
-        if not _LATIN.match(t) and any(f in t for f in _EVENT_FRAGMENTS):
+        if not _LATIN.match(t) and (any(f in t for f in _EVENT_FRAGMENTS) or _TITLE_UNIT.search(t)):
             continue
         out.append(t)
     return out

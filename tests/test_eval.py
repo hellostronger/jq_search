@@ -407,6 +407,11 @@ def test_underspecified_catches_relative_and_deictic_heads():
         "客户转换成本极高：动态PE大约多少？",
         "就有一块是它造的——份额多少？",
         "美联储10月加息的概率从公布前的多少？",
+        "今年1-8月营业收入多少？",
+        "过去10年股东总回报突破多少？",
+        "北美收入下滑超过多少？",
+        "交易价值约多少？",
+        "他管理这三只基金的任职回报均突破多少？",
     ]
     for q in bad:
         assert _underspecified(q), q

@@ -30,3 +30,6 @@ include = ["treewiki*"]
 
 [tool.setuptools.package-data]
 treewiki = ["web/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

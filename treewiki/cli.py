@@ -82,6 +82,45 @@ def tree(doc_id: str, summary: bool = typer.Option(False, "--summary", help="显
     console.print(skeleton_text(kb.load_tree(doc_id).structure, with_summary=summary))
 
 
+@app.command()
+def evalset(
+    out: Path = Path("eval_out/dataset.jsonl"),
+    doc_id: str = "src_0001",
+    seed: int = 20261020,
+    public: bool = False,
+):
+    """构造验证集：问题 + 标准答案 + 标准引用（gold 页由文章标记机械确定）
+
+    --public 去掉原文整句与文章标题，产出可公开提交的脱敏版。
+    """
+    from .eval.dataset import build_dataset, sanitize_items, write_jsonl
+
+    ds = build_dataset(KB(kb_home()), doc_id, seed=seed)
+    items = sanitize_items(ds["items"]) if public else ds["items"]
+    write_jsonl(out, items)
+    console.print(
+        f"[green]写出 {len(ds['items'])} 条 → {out}[/green]  "
+        f"文章 {ds['articles']} / 页 {ds['pages']} / 事实候选 {ds['candidate_facts']} "
+        f"(A {ds['candidate_a']} · B {ds['candidate_b']} · S {ds['candidate_s']}) "
+        f"时序 {ds['candidate_timeline']} 未收录 {ds['candidate_absent']}"
+    )
+
+
+@app.command()
+def evalrun(
+    dataset: Path = Path("eval_out/dataset.jsonl"),
+    results: Path = Path("eval_out/retrieval.jsonl"),
+    mode: str = "retrieval",
+    workers: int = 4,
+    limit: int = 0,
+    tiers: str = "A,B,S,C,D",
+):
+    """评测：retrieval/tree/floor 零成本探针，full 并发调用真实模型跑端到端"""
+    from .eval.runner import main as run
+
+    run(dataset, results, mode, workers, limit, tiers, kb_home())
+
+
 def main():
     app()
 

@@ -73,7 +73,7 @@ def grade(item: dict, result: dict, lows: list[str] | None = None) -> dict:
     elif tier == "C":
         ok = coverage >= 0.5
     else:
-        ok = figure_ok and grounded
+        ok = figure_ok and grounded and not refused
     return {
         "id": item["id"],
         "tier": tier,
@@ -89,7 +89,7 @@ def grade(item: dict, result: dict, lows: list[str] | None = None) -> dict:
         "figure_hit": len(hit_all),
         "figure_total": len(figures),
         "refused": refused,
-        "grader": 3,
+        "grader": 4,
         "gold_pages": sorted(gold),
         "cited_pages": sorted(got),
         "read_pages": result.get("read_pages") or [],
@@ -316,8 +316,8 @@ def kb_home_of(home: Path | None) -> Path:
 
 
 def _regrade(row: dict) -> dict:
-    """旧结果文件按新口径回填两个派生标记：诚实拒答允许顺带引用邻近页。"""
-    if row.get("grader", 0) >= 3:
+    """旧结果文件按新口径回填派生标记：诚实拒答允许顺带引用邻近页，且不算答对。"""
+    if row.get("grader", 0) >= 4:
         return row
     refused = bool(_REFUSE.search(row.get("answer_head") or ""))
     grounded = row["page_hit"] or row.get("article_hit") or row.get("citation_verifiable")
@@ -325,9 +325,12 @@ def _regrade(row: dict) -> dict:
         **row,
         "refused": refused,
         "unsupported_citation": bool(row.get("cited_pages")) and not grounded and not refused,
+        "grader": 4,
     }
     if row["tier"] == "D":
         row["ok"] = refused
+    elif row["tier"] in ("A", "B", "S"):
+        row["ok"] = bool(row.get("ok")) and not refused
     return row
 
 

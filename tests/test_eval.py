@@ -135,6 +135,25 @@ def test_grade_honest_hedge_with_adjacent_citation_is_not_called_hallucination()
     assert row["ok"] is False
 
 
+def test_grade_refusal_quoting_the_gold_figure_is_not_success():
+    item = {
+        "id": "1",
+        "tier": "B",
+        "question": "台积电预计2026年营收增长多少？",
+        "gold_pages": [12],
+        "gold_span": [12, 12],
+        "gold_figures": ["30%"],
+    }
+    refusal = {
+        "answer": "文档未包含台积电官方的全年营收增速，只提到另一项业务增长 30%",
+        "citations": [{"doc_id": "d", "pages": [12]}],
+    }
+    row = grade(item, refusal)
+    assert row["refused"] is True
+    assert row["figure_hit"] == 1
+    assert row["ok"] is False
+
+
 def test_sanitize_items_keeps_grading_fields_and_drops_prose():
     from treewiki.eval.dataset import sanitize_items
 

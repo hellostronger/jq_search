@@ -34,6 +34,7 @@ DEFAULTS: dict[str, Any] = {
         "locate_retries": 1,
         "answer_attempts": 3,
         "summary_chars": 6000,
+        "lexical_pages": 12,
     },
 }
 

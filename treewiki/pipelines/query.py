@@ -14,6 +14,7 @@ LOCALIZE_SYS = """你是文档检索专家，正在一棵文档树索引中定�
 - "expand"：进入某分支，返回其子节点
 - "read"：读取该节点覆盖页的原文；叶节点直接读，中间节点会读取其代表性叶子
 - 必须至少给出一个动作，编号必须原样来自候选节点列表，禁止臆造
+- 若另列了「字面命中节点」，其编号同样可选，通常是问题关键词在原文里直接命中的最直接证据
 - 问题需要全局统计/汇总时，优先 expand 覆盖全篇的分支，或 read 多个不同分支"""
 
 ANSWER_SYS = """你是严谨的问答助手，只能依据提供的节点摘要和文档页原文回答。
@@ -27,20 +28,68 @@ ANSWER_SYS = """你是严谨的问答助手，只能依据提供的节点摘要�
 _CITE_PARTS = re.compile(r"[,，;；、\s]+")
 _CITE_ITEM = re.compile(r"^[pP]?\s*(\d+)(?:\s*[-–~至]\s*[pP]?\s*(\d+))?$")
 _DIGITS = re.compile(r"\d{3,}")
+_LATIN_TERM = re.compile(r"[A-Za-z][A-Za-z0-9+.\-_]{1,}")
+_CJK_RUN = re.compile(r"[\u4e00-\u9fff]{2,}")
 
 
-def _listing(nodes: list[Node]) -> str:
+def anchor_terms(question: str) -> list[str]:
+    """取问题里最有区分度的字面锚词：优先拉丁词（实体名通常是拉丁文）；
+    纯中文问题只取 4 字以上片段，过短的词（"风险""溢价"）太泛，不做锚词。"""
+    latin = [t.lower() for t in _LATIN_TERM.findall(question) if len(t) >= 3]
+    cjk = [t for t in _CJK_RUN.findall(question) if len(t) >= 4]
+    return list(dict.fromkeys(latin or cjk))[:4]
+
+
+def _window(text: str, terms: list[str], limit: int) -> str:
+    """摘要窗口：命中锚词的句子必须落在窗口内，否则长摘要里的实体会被截掉。"""
+    if len(text) <= limit:
+        return text
+    low = text.lower()
+    positions = [low.find(t) for t in terms if t and low.find(t) >= 0]
+    start = 0
+    if positions:
+        start = min(max(min(positions) - limit // 3, 0), len(text) - limit)
+    end = start + limit
+    return ("…" if start > 0 else "") + text[start:end] + ("…" if end < len(text) else "")
+
+
+def _lexical_pages(texts: list[str], terms: list[str], cap: int) -> list[int]:
+    """返回同时包含全部锚词的页，按命中次数排序。"""
+    if not terms or cap <= 0:
+        return []
+    scored: list[tuple[int, int]] = []
+    for idx, text in enumerate(texts, start=1):
+        low = text.lower()
+        counts = [low.count(t) for t in terms]
+        if all(c > 0 for c in counts):
+            scored.append((idx, sum(counts)))
+    ranked = sorted(scored, key=lambda x: (-x[1], x[0]))
+    return sorted(page for page, _ in ranked[:cap])
+
+
+def _nodes_for_pages(leaves: list[Node], pages: list[int], cap: int) -> list[Node]:
+    """把命中页映射到叶节点。按文档顺序均匀取样：事件类问题的证据常散落在
+    时间线两端（首发与后续反转），只取命中最多的节点会丢掉尾部进展。"""
+    hit = set(pages)
+    picked = [
+        n for n in leaves if any(n.start_index <= p <= n.end_index for p in hit)
+    ]
+    return _spread_sample(picked, cap)
+
+
+def _listing(nodes: list[Node], terms: list[str] | None = None) -> str:
+    terms = terms or []
     lines: list[str] = []
     for n in nodes:
         line = f"[{n.node_id}] {n.title} (p{n.start_index}-{n.end_index})"
         if n.summary:
-            line += f" — {n.summary[:200]}"
+            line += f" — {_window(n.summary, terms, 200)}"
         lines.append(line)
         children = _spread_sample(n.nodes, 12)
         for ch in children:
             lines.append(
                 f"    [{ch.node_id}] {ch.title} (p{ch.start_index}-{ch.end_index})"
-                + (f" — {ch.summary[:120]}" if ch.summary else "")
+                + (f" — {_window(ch.summary, terms, 120)}" if ch.summary else "")
             )
         if len(n.nodes) > len(children):
             lines.append(f"    … 共 {len(n.nodes)} 个子节点（仅列出代表性 {len(children)} 个）")
@@ -174,18 +223,26 @@ def _localize(
     question: str,
     frontier: list[Node],
     retries: int,
+    terms: list[str] | None = None,
+    hint: list[Node] | None = None,
 ) -> tuple[list[str], list[str], str, int]:
+    terms = terms or []
+    hint = hint or []
     valid = {n.node_id for n in _visible(frontier) if n.node_id}
+    valid |= {n.node_id for n in hint if n.node_id}
+    content = (
+        f"文档：{tree.doc_name} —— {tree.doc_description}\n"
+        f"问题：{question}\n\n"
+        f"当前候选节点：\n{_listing(frontier, terms)}"
+    )
+    if hint:
+        content += (
+            "\n\n字面命中节点（问题关键词在原文里直接命中，优先 read）：\n"
+            f"{_listing(hint, terms)}"
+        )
     base = [
         {"role": "system", "content": LOCALIZE_SYS},
-        {
-            "role": "user",
-            "content": (
-                f"文档：{tree.doc_name} —— {tree.doc_description}\n"
-                f"问题：{question}\n\n"
-                f"当前候选节点：\n{_listing(frontier)}"
-            ),
-        },
+        {"role": "user", "content": content},
     ]
     messages = list(base)
     reason = ""
@@ -242,9 +299,12 @@ def _ancestor_map(structure: list[Node]) -> dict[str, list[Node]]:
     return parents
 
 
-def _summary_context(tree: TreeDoc, read_nodes: list[Node], max_chars: int) -> str:
+def _summary_context(
+    tree: TreeDoc, read_nodes: list[Node], max_chars: int, terms: list[str] | None = None
+) -> str:
     if max_chars <= 0:
         return ""
+    terms = terms or []
     parents = _ancestor_map(tree.structure)
     picked: list[tuple[Node, list[Node]]] = []
     seen: set[str] = set()
@@ -262,7 +322,7 @@ def _summary_context(tree: TreeDoc, read_nodes: list[Node], max_chars: int) -> s
     used = 0
     for n, chain in picked:
         path = " / ".join([x.title for x in chain] + [n.title])
-        line = f"[{n.node_id}] {path}（p{n.start_index}-{n.end_index}）：{n.summary[:1200]}"
+        line = f"[{n.node_id}] {path}（p{n.start_index}-{n.end_index}）：{_window(n.summary, terms, 1200)}"
         room = max_chars - used
         if room <= 0:
             break
@@ -334,6 +394,14 @@ def query_raw(
     trace: list[dict] = []
     read_cap = 8
 
+    terms = anchor_terms(question)
+    lex_pages = _lexical_pages(
+        kb.read_pages(doc_id, 1, total), terms, int(qcfg.get("lexical_pages", 12))
+    )
+    lex_nodes = _nodes_for_pages(
+        [n for n, _ in iter_nodes(tree.structure) if not n.nodes], lex_pages, read_cap
+    )
+
     frontier = list(tree.structure)
     read_nodes: list[Node] = []
     for rnd in range(1, int(qcfg["max_rounds"]) + 1):
@@ -346,6 +414,8 @@ def query_raw(
             question,
             frontier,
             int(qcfg.get("locate_retries", 1)),
+            terms,
+            lex_nodes,
         )
         trace.append(
             {
@@ -378,17 +448,17 @@ def query_raw(
         frontier = _spread_sample(next_frontier, 10)
 
     fallback = "none"
-    if not read_nodes:
+    if not read_nodes and not lex_nodes:
         leaves = [n for n, _ in iter_nodes(tree.structure) if not n.nodes]
         read_nodes = _spread_sample(leaves, read_cap)
         fallback = "spread_sample" if read_nodes else "summary_only"
-    read_nodes = _dedupe(read_nodes)[:read_cap]
+    read_nodes = _dedupe(lex_nodes + read_nodes)[:read_cap]
     pages = _pages_of(read_nodes, total, int(qcfg["max_pages"]))
     if not pages and fallback == "none":
         fallback = "summary_only"
 
     summary_ctx = _summary_context(
-        tree, read_nodes, int(qcfg.get("summary_chars", 6000))
+        tree, read_nodes, int(qcfg.get("summary_chars", 6000)), terms
     )
     node_line = "; ".join(
         f"{n.title}(p{n.start_index}-{n.end_index})" for n in read_nodes
@@ -453,6 +523,11 @@ def query_raw(
             for n in read_nodes
         ],
         "fallback": fallback,
+        "lexical": {
+            "terms": terms,
+            "pages": lex_pages,
+            "nodes": [n.node_id for n in lex_nodes],
+        },
         "rounds": trace,
         "usage": llm.usage(),
     }

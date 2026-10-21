@@ -6,8 +6,11 @@ from treewiki.config import DEFAULTS
 from treewiki.core.store import KB
 from treewiki.core.tree import Node, TreeDoc, assign_ids, flash_skeleton
 from treewiki.pipelines.query import (
+    _nodes_for_pages,
     _parse_citations,
     _spread_sample,
+    _window,
+    anchor_terms,
     query_raw,
 )
 
@@ -392,3 +395,96 @@ def test_query_raw_insufficient_retry_keeps_read_pages(tmp_path):
     assert 20 in result["read_pages"]
     assert result["citations"] == [{"doc_id": doc_id, "pages": [20]}]
     assert "上一次判定证据不足" in _last_user(llm)
+
+
+def test_anchor_terms_prefers_latin_entity_names():
+    assert anchor_terms("iPhone Duo 发行价格多少？溢价怎么样？") == ["iphone", "duo"]
+    assert anchor_terms("有哪些风险？") == ["有哪些风险"]
+
+
+def test_window_keeps_anchor_term_visible_in_long_summary():
+    summary = "本节为当日资讯汇总。" * 40 + "iPhone Duo 预售 15999 元" + "其余内容略。"
+    snippet = _window(summary, ["iphone", "duo"], 200)
+    assert "duo" in snippet.lower()
+    assert len(snippet) <= 202
+    assert _window("短摘要", ["duo"], 200) == "短摘要"
+
+
+def _duo_kb(tmp_path):
+    filler = "本节为当日资讯汇总，覆盖市场、公司与产业动态。"
+    duo_text = filler * 12 + "苹果首款折叠屏 iPhone Duo 于 10 月 16 日开启预购，售价 15999 元起。"
+    pages = [f"# 第 {i} 组\n\n普通资讯内容 {i}" for i in range(1, 6)] + [duo_text]
+    return _make_kb(
+        tmp_path,
+        pages,
+        lambda: [
+            Node(
+                title=f"2026-10-1{i} 第{i}组（8 篇）",
+                start_index=i,
+                end_index=i,
+                summary=(duo_text if i == 6 else filler * 12),
+            )
+            for i in range(1, 7)
+        ],
+    )
+
+
+def test_query_raw_lexical_hit_rescues_wrong_branch(tmp_path):
+    """定位模型选错分支时，字面命中的原文页仍要进入证据。"""
+    kb, doc_id = _duo_kb(tmp_path)
+    llm = FakeLLM(
+        [
+            {"read": ["0002"], "expand": [], "reason": "以为是金融文章集，与iPhone无关"},
+            _answer([6], "iPhone Duo 售价 15999 元起 [p6]"),
+        ]
+    )
+    result = query_raw(
+        doc_id, "iPhone Duo 发行价格多少？溢价怎么样？", kb, llm, _cfg()
+    )
+    assert result["lexical"]["terms"] == ["iphone", "duo"]
+    assert result["lexical"]["pages"] == [6]
+    assert result["read_pages"] == [2, 6]
+    assert result["read_nodes"][0]["id"] == "0006"
+    assert "15999" in _last_user(llm)
+    assert result["citations"] == [{"doc_id": doc_id, "pages": [6]}]
+
+
+def test_query_raw_lexical_hit_is_offered_to_localizer(tmp_path):
+    """命中节点的摘要即使实体词在 200 字之后，也要出现在定位提示里。"""
+    kb, doc_id = _duo_kb(tmp_path)
+    llm = FakeLLM(
+        [
+            {"read": ["0006"], "expand": [], "reason": "字面命中节点直接读"},
+            _answer([6], "iPhone Duo 售价 15999 元起 [p6]"),
+        ]
+    )
+    query_raw(doc_id, "iPhone Duo 发行价格多少？", kb, llm, _cfg())
+    prompt = llm.calls[0][-1]["content"]
+    assert "字面命中节点" in prompt
+    assert "[0006]" in prompt
+    assert "iPhone Duo" in prompt.split("字面命中节点")[1]
+
+
+def test_nodes_for_pages_keeps_timeline_ends():
+    leaves = [
+        Node(title=f"n{i}", start_index=i, end_index=i, node_id=f"{i:04d}")
+        for i in range(1, 13)
+    ]
+    picked = _nodes_for_pages(leaves, list(range(1, 13)), 4)
+    assert [n.node_id for n in picked][0] == "0001"
+    assert [n.node_id for n in picked][-1] == "0012"
+    assert len(picked) == 4
+
+
+def test_query_raw_without_lexical_hit_keeps_previous_fallback(tmp_path):
+    kb, doc_id = _duo_kb(tmp_path)
+    llm = FakeLLM(
+        [
+            {"read": ["9999"], "expand": [], "reason": "幻觉"},
+            {"read": ["9999"], "expand": [], "reason": "幻觉"},
+            _answer([1]),
+        ]
+    )
+    result = query_raw(doc_id, "整体行情如何？", kb, llm, _cfg())
+    assert result["lexical"]["pages"] == []
+    assert result["fallback"] == "spread_sample"

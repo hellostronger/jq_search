@@ -3,273 +3,448 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TreeWiki</title>
-<style>
-  :root {
-    --bg: #f6f7f9; --card: #fff; --line: #e5e8ec; --text: #24292f;
-    --muted: #6a737d; --accent: #2563eb; --ok: #1a7f37; --err: #cf222e;
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); }
-  header { background: var(--card); border-bottom: 1px solid var(--line); padding: 14px 24px; display: flex; align-items: baseline; gap: 12px; }
-  header h1 { font-size: 18px; margin: 0; }
-  header .sub { color: var(--muted); font-size: 12px; }
-  main { max-width: 980px; margin: 20px auto; padding: 0 16px; display: grid; gap: 16px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
-  .card h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); font-weight: 600; letter-spacing: .5px; }
-  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
-  input[type=text], input[type=password], select {
-    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; background: #fff;
-  }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
-  button {
-    padding: 8px 16px; border: none; border-radius: 6px; background: var(--accent); color: #fff;
-    font-size: 13px; cursor: pointer; margin-top: 12px;
-  }
-  button.secondary { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
-  button:disabled { opacity: .5; cursor: wait; }
-  .msg { font-size: 12px; margin-top: 10px; }
-  .msg.ok { color: var(--ok); } .msg.err { color: var(--err); }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
-  th { color: var(--muted); font-weight: 500; font-size: 12px; }
-  .stages { font-size: 12px; color: var(--muted); background: #fafbfc; border: 1px solid var(--line);
-            border-radius: 6px; padding: 8px 10px; margin-top: 10px; max-height: 160px; overflow: auto; white-space: pre-wrap; }
-  .answer { border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; margin-top: 12px;
-            font-size: 14px; line-height: 1.7; white-space: pre-wrap; }
-  .cites { margin-top: 8px; font-size: 12px; color: var(--muted); }
-  .cites span { background: #eef4ff; color: var(--accent); border-radius: 4px; padding: 1px 7px; margin-right: 4px; }
-  details { margin-top: 10px; font-size: 12px; color: var(--muted); }
-  pre { background: #fafbfc; border: 1px solid var(--line); border-radius: 6px; padding: 10px; overflow: auto; max-height: 260px; }
-  .row { display: flex; gap: 10px; align-items: center; }
-  .row > * { flex: 1; }
-  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; background: #eef4ff; color: var(--accent); }
-  .desc { color: var(--muted); font-size: 12px; margin-top: 2px; }
-</style>
+<title>TreeWiki · PageIndex + LLMWiki 双产物工作台</title>
+<link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<header>
-  <h1>TreeWiki</h1>
-  <span class="sub">LLMWiki × PageIndex — M1：MinerU 解析 → 树索引 → 推理遍历问答</span>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">TW</span>
+    <div>
+      <h1>TreeWiki</h1>
+      <p>PageIndex 源树 × LLMWiki 持久知识</p>
+    </div>
+  </div>
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="overview">总览</button>
+    <button class="tab" data-tab="source">源树 <span class="mini-tag">PageIndex</span></button>
+    <button class="tab" data-tab="wiki">Wiki <span class="mini-tag">LLMWiki</span></button>
+    <button class="tab" data-tab="query">问答</button>
+    <button class="tab" data-tab="settings">设置</button>
+  </nav>
+  <div class="top-status" id="top_status">
+    <span class="dot"></span><span id="top_status_text">加载中</span>
+  </div>
 </header>
+
 <main>
+  <!-- ============================================================ 总览 -->
+  <section class="view active" id="view-overview">
+    <div class="hero card">
+      <div class="hero-copy">
+        <span class="eyebrow">双产物架构</span>
+        <h2>一棵树负责“找得到”，一层 wiki 负责“记得住”</h2>
+        <p>
+          PageIndex 把每篇文档变成可推理遍历的目录树，检索时留下定位轨迹和页级证据；
+          LLMWiki 把多篇文档蒸馏成持久、互链的 markdown 知识页，让知识随摄取与问答持续复利。
+        </p>
+      </div>
+      <div class="chain" aria-label="溯源链">
+        <div class="chain-step"><span>答案</span><small>带引用</small></div>
+        <div class="chain-arrow">→</div>
+        <div class="chain-step wiki-step"><span>Wiki 页</span><small>M2 编译层</small></div>
+        <div class="chain-arrow">→</div>
+        <div class="chain-step"><span>树节点</span><small>定位层</small></div>
+        <div class="chain-arrow">→</div>
+        <div class="chain-step"><span>原始页</span><small>证据层</small></div>
+      </div>
+    </div>
 
-  <section class="card">
-    <h2>设置</h2>
-    <div class="grid">
-      <div>
-        <label>LLM Base URL（OpenAI 兼容）</label>
-        <input type="text" id="llm_base_url" placeholder="https://api.openai.com/v1">
+    <div class="grid-two product-grid">
+      <article class="card product-card source-product">
+        <div class="product-head">
+          <div>
+            <span class="eyebrow">INDEX LAYER</span>
+            <h3>PageIndex 源树</h3>
+          </div>
+          <span class="status-chip ok" id="pi_status">已运行</span>
+        </div>
+        <p class="product-desc">面向单篇文档的导航结构：保留原始目录层级、页范围和节点摘要，不沉淀跨文档知识。</p>
+        <div class="stat-row">
+          <div><strong id="stat_sources">0</strong><span>来源文档</span></div>
+          <div><strong id="stat_nodes">0</strong><span>树节点</span></div>
+          <div><strong id="stat_pages">0</strong><span>原始页</span></div>
+        </div>
+        <ul class="artifact-list">
+          <li><code>index/trees/{doc_id}.json</code><span>源树 + 节点摘要</span></li>
+          <li><code>query rounds</code><span>expand / read / reason 定位轨迹</span></li>
+          <li><code>[p12]</code><span>答案中的页级引用</span></li>
+        </ul>
+        <button class="link-btn" data-goto="source">打开源树工作台 →</button>
+      </article>
+
+      <article class="card product-card wiki-product">
+        <div class="product-head">
+          <div>
+            <span class="eyebrow">KNOWLEDGE LAYER</span>
+            <h3>LLMWiki 持久 Wiki</h3>
+          </div>
+          <span class="status-chip" id="wiki_status">读取中</span>
+        </div>
+        <p class="product-desc">面向多篇文档的编译层：实体、主题、来源摘要与分析页互相链接，每条关键事实保留 claim 级引用。</p>
+        <div class="stat-row">
+          <div><strong id="stat_wiki_pages">0</strong><span>知识页</span></div>
+          <div><strong id="stat_wiki_links">0</strong><span>互链</span></div>
+          <div><strong id="stat_wiki_special">0</strong><span>目录/日志</span></div>
+        </div>
+        <ul class="artifact-list">
+          <li><code>wiki/entities|topics|sources|analyses/</code><span>互链 markdown 知识页</span></li>
+          <li><code>wiki/index.md · log.md</code><span>内容目录与追加式时间线</span></li>
+          <li><code>index/wiki_tree.json</code><span>Wiki 目录树</span></li>
+        </ul>
+        <button class="link-btn" data-goto="wiki">查看 Wiki 产物视图 →</button>
+      </article>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <span class="eyebrow">ARTIFACTS</span>
+          <h3>产物清单与当前状态</h3>
+        </div>
+        <span class="muted">状态来自当前知识库文件，不使用演示数据</span>
       </div>
-      <div>
-        <label>API Key</label>
-        <input type="password" id="llm_api_key" placeholder="sk-...">
-      </div>
-      <div>
-        <label>Index 模型（建树/摘要，用便宜的）</label>
-        <input type="text" id="llm_index_model" placeholder="gpt-4o-mini">
-      </div>
-      <div>
-        <label>Chat 模型（问答/遍历，用强的）</label>
-        <input type="text" id="llm_chat_model" placeholder="gpt-4o">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>产物</th><th>所属层</th><th>生成时机</th><th>当前状态</th><th>位置</th></tr>
+          </thead>
+          <tbody id="artifact_rows"></tbody>
+        </table>
       </div>
     </div>
-    <div class="grid">
-      <div>
-        <label>MinerU Token（mineru.net）</label>
-        <input type="password" id="mineru_token" placeholder="eyJhbGci...">
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <span class="eyebrow">DIFFERENCE</span>
+          <h3>两者产出有什么区别</h3>
+        </div>
       </div>
-      <div>
-        <label>MinerU model_version</label>
-        <select id="mineru_model_version">
-          <option value="pipeline">pipeline（默认）</option>
-          <option value="vlm">vlm</option>
-        </select>
+      <div class="table-wrap">
+        <table class="compare-table">
+          <thead><tr><th>维度</th><th>PageIndex 源树</th><th>LLMWiki 持久 Wiki</th></tr></thead>
+          <tbody>
+            <tr><td>知识形态</td><td>单文档导航结构（目录 + 摘要）</td><td>跨文档蒸馏、综合、互链的知识页</td></tr>
+            <tr><td>构建节奏</td><td>每篇文档一次，随源文档不可变</td><td>持续增量维护，每加来源/问题都在变富</td></tr>
+            <tr><td>检索方式</td><td>LLM 自顶向下推理遍历树</td><td>index.md + [[互链]] + grep（M3）</td></tr>
+            <tr><td>溯源精度</td><td>页级：答案 → 节点 → 页码</td><td>claim 级：知识页 → doc:pages → 源树</td></tr>
+            <tr><td>当前状态</td><td><span class="status-chip ok">M1 已运行</span></td><td><span class="status-chip pending">M2 规划中</span></td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
-    <div class="row">
-      <button id="btn_save">保存配置</button>
-      <button class="secondary" id="btn_test">测试 LLM 连接</button>
-    </div>
-    <div class="msg" id="config_msg"></div>
   </section>
 
-  <section class="card">
-    <h2>文档（摄取 → 建树）</h2>
-    <div class="row">
-      <input type="text" id="file_display" placeholder="选择文件…（md/txt 本地解析，其余走 MinerU）" disabled>
-      <input type="file" id="file_input" accept=".pdf,.doc,.docx,.html,.md,.markdown,.txt" style="flex:0 0 180px">
+  <!-- ============================================================ 源树 -->
+  <section class="view" id="view-source">
+    <div class="toolbar card">
+      <div class="toolbar-left">
+        <label class="inline-label">文档</label>
+        <select id="source_select"></select>
+        <button class="btn secondary small" id="btn_refresh_sources">刷新</button>
+      </div>
+      <button class="btn small" id="btn_upload_toggle">上传并建树</button>
     </div>
-    <div class="row" style="margin-top:8px">
-      <input type="text" id="file_desc" maxlength="500" placeholder="补充描述（可选）：例如「v1.0 平台部署文档」">
-      <button id="btn_upload" style="flex:0 0 100px; margin-top:0">上传并建树</button>
+
+    <div class="card upload-panel hidden" id="upload_panel">
+      <div class="card-head">
+        <div>
+          <span class="eyebrow">INGEST</span>
+          <h3>摄取一个来源</h3>
+        </div>
+        <span class="muted">PDF / Word / HTML 走 MinerU；md / txt 本地解析</span>
+      </div>
+      <div class="upload-grid">
+        <input type="text" id="file_display" placeholder="选择文件…" disabled>
+        <input type="file" id="file_input" accept=".pdf,.doc,.docx,.html,.md,.markdown,.txt">
+      </div>
+      <div class="upload-grid">
+        <input type="text" id="file_desc" maxlength="500" placeholder="补充描述（可选）：例如「v1.0 平台部署文档」">
+        <button class="btn" id="btn_upload">上传并建树</button>
+      </div>
+      <div class="stages hidden" id="ingest_stages"></div>
     </div>
-    <div class="stages" id="ingest_stages" style="display:none"></div>
-    <table id="sources_table" style="margin-top:12px">
-      <thead><tr><th>doc_id</th><th>文件</th><th>页数</th><th>节点</th><th>状态</th></tr></thead>
-      <tbody></tbody>
-    </table>
-    <details id="tree_details"><summary>查看选中文档的树索引</summary><pre id="tree_skeleton"></pre></details>
+
+    <div class="card source-meta" id="source_meta">
+      <div class="empty-inline">选择一个已建树的文档，查看 PageIndex 产物。</div>
+    </div>
+
+    <div class="split">
+      <aside class="card tree-pane">
+        <div class="pane-head">
+          <div>
+            <span class="eyebrow">SOURCE TREE</span>
+            <h3>树索引</h3>
+          </div>
+          <input type="text" id="tree_search" placeholder="搜索节点标题或摘要">
+        </div>
+        <div class="tree-legend">
+          <span><i class="legend-dot summary"></i>有摘要</span>
+          <span><i class="legend-dot leaf"></i>叶节点</span>
+          <span class="muted" id="tree_count"></span>
+        </div>
+        <div id="tree_root" class="tree">
+          <div class="empty-inline">暂无文档。请先上传一个来源。</div>
+        </div>
+      </aside>
+
+      <section class="card node-pane">
+        <div id="node_detail">
+          <div class="empty-state compact">
+            <h3>节点详情</h3>
+            <p>从左侧选择节点，查看它产出了什么：标题、页范围、LLM 摘要与对应原始页。</p>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <span class="eyebrow">SOURCES</span>
+          <h3>全部知识源</h3>
+        </div>
+        <span class="muted">每行是一棵独立的 PageIndex 源树</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>doc_id</th><th>文件</th><th>页数</th><th>节点</th><th>摄取时间</th><th>状态</th></tr></thead>
+          <tbody id="sources_table"></tbody>
+        </table>
+      </div>
+    </div>
   </section>
 
-  <section class="card">
-    <h2>问答（树遍历检索）</h2>
-    <div class="row">
-      <select id="query_doc"></select>
-      <button id="btn_query" style="flex:0 0 90px">提问</button>
+  <!-- ============================================================ Wiki -->
+  <section class="view" id="view-wiki">
+    <div class="card wiki-banner" id="wiki_banner"></div>
+
+    <div id="wiki_ready" class="hidden">
+      <div class="split wiki-split">
+        <aside class="card wiki-nav">
+          <div class="pane-head">
+            <div>
+              <span class="eyebrow">WIKI PAGES</span>
+              <h3>知识页</h3>
+            </div>
+            <span class="muted" id="wiki_page_count"></span>
+          </div>
+          <div id="wiki_inventory"></div>
+          <div id="wiki_page_list" class="wiki-page-list"></div>
+          <div class="special-files">
+            <h4>特殊文件</h4>
+            <div id="wiki_special_buttons"></div>
+          </div>
+        </aside>
+        <section class="card wiki-view" id="wiki_view">
+          <div class="empty-state compact">
+            <h3>选择一个 Wiki 页</h3>
+            <p>左侧列出真实落盘的 markdown 页面。</p>
+          </div>
+        </section>
+      </div>
     </div>
-    <label>问题</label>
-    <input type="text" id="query_text" placeholder="例如：Q1 的总收入是多少？">
-    <div id="query_result" style="display:none">
-      <div class="answer" id="answer"></div>
-      <div class="cites" id="cites"></div>
-      <details><summary>定位轨迹（rounds / 读取页）</summary><pre id="trace"></pre></details>
+
+    <div id="wiki_empty">
+      <div class="empty-explainer card">
+        <div class="empty-explainer-head">
+          <span class="status-chip pending">M2 待接入</span>
+          <h2>当前知识库还没有 LLMWiki 产物</h2>
+          <p>
+            M1 只运行 PageIndex 通路，所以 <code>kb/wiki/</code> 目前为空。
+            下面是 LLMWiki 会产出的内容与真实落盘位置；当 M2 生成文件后，本页会自动切换为可浏览视图。
+          </p>
+        </div>
+      </div>
+
+      <div class="grid-two">
+        <div class="card">
+          <span class="eyebrow">PAGE TYPES</span>
+          <h3>四类知识页</h3>
+          <div class="type-list">
+            <div class="type-row">
+              <span class="type-icon">EN</span>
+              <div><strong>实体页</strong><code>wiki/entities/</code><p>公司、人物、产品等实体，聚合跨来源事实，附 claim 级引用。</p></div>
+            </div>
+            <div class="type-row">
+              <span class="type-icon">TP</span>
+              <div><strong>主题页</strong><code>wiki/topics/</code><p>概念、方法与主题综述，用 [[互链]] 连接相关实体与来源。</p></div>
+            </div>
+            <div class="type-row">
+              <span class="type-icon">SR</span>
+              <div><strong>来源摘要页</strong><code>wiki/sources/</code><p>每篇原始文档一页，结构化沉淀关键事实和页码。</p></div>
+            </div>
+            <div class="type-row">
+              <span class="type-icon">AN</span>
+              <div><strong>分析页</strong><code>wiki/analyses/</code><p>好答案回填形成的新知识页，让查询也成为复利资产。</p></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <span class="eyebrow">STRUCTURE FILES</span>
+          <h3>目录、时间线与 Wiki 树</h3>
+          <div class="type-list">
+            <div class="type-row">
+              <span class="type-icon">IDX</span>
+              <div><strong>index.md</strong><code>wiki/index.md</code><p>全 wiki 内容目录：按类别组织，每页一行「链接 + 一句话摘要」。</p></div>
+            </div>
+            <div class="type-row">
+              <span class="type-icon">LOG</span>
+              <div><strong>log.md</strong><code>wiki/log.md</code><p>追加式时间线，记录每次 ingest / query / lint。</p></div>
+            </div>
+            <div class="type-row">
+              <span class="type-icon">SCH</span>
+              <div><strong>SCHEMA.md</strong><code>wiki/SCHEMA.md</code><p>wiki 的结构约定：命名、页面类型、互链与维护流程。</p></div>
+            </div>
+            <div class="type-row">
+              <span class="type-icon">TRE</span>
+              <div><strong>wiki_tree.json</strong><code>index/wiki_tree.json</code><p>对整个 wiki 建的目录树，M3 用于 wiki 优先检索。</p></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <span class="eyebrow">TARGET FORMAT</span>
+            <h3>Wiki 页面格式示例</h3>
+          </div>
+          <span class="muted">来自 docs/DESIGN.md，仅作格式说明，不是当前数据</span>
+        </div>
+        <pre class="sample-code">---
+id: ent_disney
+title: 华特迪士尼公司
+type: entity
+tags: [媒体, 流媒体]
+sources: [src_0007, src_0003]
+citations:
+  - doc: src_0007
+    pages: [1, 2]
+    claim: "FY25 Q1 收入 $24.7B，同比 +5%"
+updated: 2026-10-19
+stale: false
+---
+正文。互链写法：[[ent_disney_plus]]、[[src_0007]]。</pre>
+        <div class="note">
+          每个关键 claim 都带 <code>doc + pages</code>，可沿「Wiki 页 → 源树节点 → 原始页」下钻。
+        </div>
+      </div>
     </div>
-    <div class="msg" id="query_msg"></div>
   </section>
 
+  <!-- ============================================================ 问答 -->
+  <section class="view" id="view-query">
+    <div class="card query-box">
+      <div class="card-head">
+        <div>
+          <span class="eyebrow">TREE RETRIEVAL</span>
+          <h3>基于源树推理遍历</h3>
+        </div>
+        <span class="status-chip ok">raw · PageIndex 通路</span>
+      </div>
+      <div class="query-grid">
+        <label>文档
+          <select id="query_doc"></select>
+        </label>
+        <label>模式
+          <input type="text" value="raw（树定位 → 读页 → 引用作答）" disabled>
+        </label>
+      </div>
+      <label class="question-label">问题
+        <input type="text" id="query_text" placeholder="例如：Q1 的总收入是多少？">
+      </label>
+      <div class="query-actions">
+        <button class="btn" id="btn_query">开始树遍历</button>
+        <span class="muted" id="query_msg"></span>
+      </div>
+      <p class="hint">
+        当前只实现 raw 模式。Wiki / cascade / parallel 属于 M2/M3：前者要先有 LLMWiki 产物，后者需要两路检索与对比汇总。
+      </p>
+    </div>
+
+    <div id="query_result" class="hidden"></div>
+
+    <div class="card" id="query_intro">
+      <div class="card-head">
+        <div>
+          <span class="eyebrow">WHAT YOU WILL SEE</span>
+          <h3>一次问答会展示哪些 PageIndex 产物</h3>
+        </div>
+      </div>
+      <div class="step-grid">
+        <div class="step-card"><span class="step-num">1</span><strong>定位轨迹</strong><p>每一轮 LLM 在树上选择 expand / read 的节点与理由。</p></div>
+        <div class="step-card"><span class="step-num">2</span><strong>读取节点</strong><p>实际展开的树节点、覆盖页范围和兜底策略。</p></div>
+        <div class="step-card"><span class="step-num">3</span><strong>原文证据</strong><p>被读取的原始页，答案引用只能来自这些页。</p></div>
+        <div class="step-card"><span class="step-num">4</span><strong>带引用答案</strong><p>答案正文中的 [pX] 与结构化引用列表。</p></div>
+      </div>
+      <div class="note">
+        M2 接入后，级联模式会先命中 Wiki 页；当页面 stale 或问题要求原始细节时，再沿引用的源树下钻到页。
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ 设置 -->
+  <section class="view" id="view-settings">
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <span class="eyebrow">MODEL & PARSER</span>
+          <h3>设置</h3>
+        </div>
+        <span class="muted" id="kb_home_label"></span>
+      </div>
+      <div class="grid-two">
+        <label>LLM Base URL（OpenAI 兼容）
+          <input type="text" id="llm_base_url" placeholder="https://api.openai.com/v1">
+        </label>
+        <label>API Key
+          <input type="password" id="llm_api_key" placeholder="sk-...">
+        </label>
+        <label>Index 模型（建树 / 摘要）
+          <input type="text" id="llm_index_model" placeholder="gpt-4o-mini">
+        </label>
+        <label>Chat 模型（问答 / 遍历）
+          <input type="text" id="llm_chat_model" placeholder="gpt-4o">
+        </label>
+      </div>
+      <div class="grid-two">
+        <label>MinerU Token（mineru.net）
+          <input type="password" id="mineru_token" placeholder="eyJhbGci...">
+        </label>
+        <label>MinerU model_version
+          <select id="mineru_model_version">
+            <option value="pipeline">pipeline（默认）</option>
+            <option value="vlm">vlm</option>
+          </select>
+        </label>
+      </div>
+      <div class="form-actions">
+        <button class="btn" id="btn_save">保存配置</button>
+        <button class="btn secondary" id="btn_test">测试 LLM 连接</button>
+        <span class="muted" id="config_msg"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <span class="eyebrow">MILESTONE</span>
+          <h3>当前进度</h3>
+        </div>
+      </div>
+      <div class="milestone-row">
+        <div class="milestone done"><strong>M1 检索内核</strong><span>解析 → 源树 → 树遍历问答 + 双产物 UI</span></div>
+        <div class="milestone"><strong>M2 Wiki 层</strong><span>蒸馏、页面格式、互链、index/log</span></div>
+        <div class="milestone"><strong>M3 融合查询</strong><span>wiki 树、cascade / parallel、答案回填</span></div>
+      </div>
+    </div>
+  </section>
 </main>
-<script>
-const $ = id => document.getElementById(id);
-const esc = s => (s ?? "").toString().replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-async function api(path, opts) {
-  const r = await fetch(path, opts);
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.detail || r.status + " " + r.statusText);
-  return data;
-}
-
-function setMsg(id, text, ok) {
-  const el = $(id);
-  el.textContent = text || "";
-  el.className = "msg " + (ok ? "ok" : text ? "err" : "");
-}
-
-async function loadConfig() {
-  try {
-    const {config} = await api("/api/config");
-    $("llm_base_url").value = config.llm.base_url || "";
-    $("llm_api_key").value = config.llm.api_key || "";
-    $("llm_index_model").value = config.llm.index_model || "";
-    $("llm_chat_model").value = config.llm.chat_model || "";
-    $("mineru_token").value = config.mineru.token || "";
-    $("mineru_model_version").value = config.mineru.model_version || "pipeline";
-  } catch (e) { setMsg("config_msg", "读取配置失败：" + e.message); }
-}
-
-async function saveConfig() {
-  const payload = {llm: {
-    base_url: $("llm_base_url").value.trim(),
-    api_key: $("llm_api_key").value.trim(),
-    index_model: $("llm_index_model").value.trim(),
-    chat_model: $("llm_chat_model").value.trim(),
-  }, mineru: {
-    token: $("mineru_token").value.trim(),
-    model_version: $("mineru_model_version").value,
-  }};
-  try {
-    await api("/api/config", {method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
-    setMsg("config_msg", "已保存到 kb/config.yaml", true);
-  } catch (e) { setMsg("config_msg", "保存失败：" + e.message); }
-}
-
-async function testLLM() {
-  const btn = $("btn_test"); btn.disabled = true; setMsg("config_msg", "测试中…");
-  try {
-    const r = await api("/api/test-llm", {method: "POST"});
-    if (r.ok) setMsg("config_msg", `LLM 连通（${r.elapsed}s）：${r.reply}`, true);
-    else setMsg("config_msg", "LLM 不通：" + r.error);
-  } catch (e) { setMsg("config_msg", "请求失败：" + e.message); }
-  btn.disabled = false;
-}
-
-async function loadSources() {
-  try {
-    const {sources} = await api("/api/sources");
-    const tbody = $("sources_table").querySelector("tbody");
-    tbody.innerHTML = sources.map(s =>
-      `<tr><td>${esc(s.doc_id)}</td>` +
-      `<td>${esc(s.name)}${s.description ? '<div class="desc">' + esc(s.description) + '</div>' : ""}</td>` +
-      `<td>${s.pages}</td><td>${s.nodes || 0}</td><td><span class="badge">${esc(s.status)}</span></td></tr>`).join("")
-      || '<tr><td colspan="5" style="color:var(--muted)">暂无来源，上传一个文档开始</td></tr>';
-    const sel = $("query_doc");
-    const prev = sel.value;
-    sel.innerHTML = sources.map(s => `<option value="${esc(s.doc_id)}">${esc(s.doc_id)} — ${esc(s.name)}</option>`).join("");
-    if (prev && sources.some(s => s.doc_id === prev)) sel.value = prev;
-  } catch (e) { console.error(e); }
-}
-
-let pollTimer = null;
-async function upload() {
-  const f = $("file_input").files[0];
-  if (!f) { setMsg("ingest_msg", "先选择文件"); return; }
-  const btn = $("btn_upload"); btn.disabled = true;
-  const stages = $("ingest_stages"); stages.style.display = "block"; stages.textContent = "上传中…";
-  try {
-    const fd = new FormData(); fd.append("file", f);
-    fd.append("description", $("file_desc").value.trim());
-    const {job_id} = await api("/api/ingest", {method: "POST", body: fd});
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(async () => {
-      try {
-        const job = await api("/api/jobs/" + job_id);
-        stages.textContent = job.stages.join("\n");
-        if (job.status === "done") {
-          clearInterval(pollTimer);
-          stages.textContent += `\n✅ 完成 doc_id=${job.doc_id}`;
-          await loadSources();
-        } else if (job.status === "error") {
-          clearInterval(pollTimer);
-          stages.textContent += `\n❌ 失败：${job.error}`;
-        }
-      } catch (e) { clearInterval(pollTimer); stages.textContent += "\n轮询失败：" + e.message; }
-    }, 2500);
-  } catch (e) {
-    stages.textContent += "\n❌ " + e.message;
-  }
-  btn.disabled = false;
-}
-
-async function showTree(docId) {
-  if (!docId) return;
-  try {
-    const {skeleton} = await api("/api/skeleton/" + docId);
-    $("tree_skeleton").textContent = skeleton;
-  } catch (e) { $("tree_skeleton").textContent = e.message; }
-}
-
-async function runQuery() {
-  const docId = $("query_doc").value, q = $("query_text").value.trim();
-  if (!docId) { setMsg("query_msg", "没有可选文档"); return; }
-  if (!q) { setMsg("query_msg", "请输入问题"); return; }
-  const btn = $("btn_query"); btn.disabled = true;
-  setMsg("query_msg", "树遍历检索中…（多轮定位，可能需要几十秒）");
-  $("query_result").style.display = "none";
-  try {
-    const r = await api("/api/query", {method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({doc_id: docId, question: q, mode: "raw"})});
-    $("query_result").style.display = "block";
-    $("answer").textContent = r.answer || "（无答案）";
-    const pages = (r.citations[0] && r.citations[0].pages) || [];
-    $("cites").innerHTML = "引用页：" + (pages.length ? pages.map(p => `<span>p${p}</span>`).join("") : "无");
-    $("trace").textContent = JSON.stringify(
-      {rounds: r.rounds, read_nodes: r.read_nodes, read_pages: r.read_pages, usage: r.usage}, null, 2);
-    setMsg("query_msg", "");
-  } catch (e) { setMsg("query_msg", "失败：" + e.message); }
-  btn.disabled = false;
-}
-
-$("btn_save").onclick = saveConfig;
-$("btn_test").onclick = testLLM;
-$("btn_upload").onclick = upload;
-$("btn_query").onclick = runQuery;
-$("file_input").onchange = () => { $("file_display").value = $("file_input").files[0]?.name || ""; };
-$("query_doc").onchange = () => showTree($("query_doc").value);
-$("tree_details").onclick = () => showTree($("query_doc").value);
-
-loadConfig();
-loadSources();
-</script>
+<div class="toast hidden" id="toast"></div>
+<script src="/static/app.js"></script>
 </body>
 </html>

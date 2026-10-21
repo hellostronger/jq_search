@@ -4,12 +4,16 @@ from treewiki.eval.dataset import (
     Article,
     _cloze,
     _figures,
+    _left_context,
     _longest_run,
+    _COUNT,
     _MONEY,
     _PCT,
     _paraphrase,
     classify_by_lexicon,
+    build_timeline_items,
     expand_duplicate_gold,
+    refine_questions,
     quota,
     split_articles,
 )
@@ -212,6 +216,16 @@ def test_figures_keeps_single_digit_percentages():
     assert _figures(sent, _PCT.search(sent)) == ["5"]
 
 
+def test_figures_keeps_single_digit_with_count_units():
+    sent = "今年年底地面算力部署规模将超过2GW。"
+    assert _figures(sent, _COUNT.search(sent)) == ["2"]
+
+
+def test_left_context_uses_unit_match_to_skip_date_digits():
+    answer = "2026年2月，公司营收增长2%。"
+    assert _left_context(answer, "2%") == "2026年2月，公司营收增长"
+
+
 def _dup_item(**kw):
     base = {
         "id": "x",
@@ -252,6 +266,22 @@ def test_same_wording_with_a_different_number_is_dropped_as_ambiguous():
     assert items[0]["ambiguous"] is True
 
 
+def test_truncated_number_is_not_mistaken_for_the_same_value():
+    lows = [
+        "无关页面",
+        "贵金属上涨，现货黄金盘中突破4220美元/盎司。",
+        "贵金属上涨，现货黄金盘中突破42\n\n00美元/盎司。",
+    ]
+    item = {
+        "id": "1", "kind": "literal", "tier": "S", "question": "现货黄金盘中突破多少？",
+        "gold_pages": [2], "gold_span": [2, 2], "gold_figures": ["4220"],
+        "gold_answer": "贵金属上涨，现货黄金盘中突破4220美元/盎司。",
+    }
+    expanded, conflicted = expand_duplicate_gold([item], [t.lower() for t in lows])
+    assert (expanded, conflicted) == (0, 1)
+    assert item["ambiguous"] is True
+
+
 def test_grade_credits_any_of_multiple_gold_pages():
     item = {
         "id": "1",
@@ -264,3 +294,79 @@ def test_grade_credits_any_of_multiple_gold_pages():
     }
     alt = {"answer": "均涨 1.4%", "citations": [{"doc_id": "d", "pages": [9]}]}
     assert grade(item, alt)["ok"] is True
+
+
+def test_refine_drops_literal_clause_that_is_not_in_its_answer():
+    items = [
+        {
+            "id": "1",
+            "kind": "literal",
+            "tier": "S",
+            "question": "中国高校培养了：美国为多少？",
+            "gold_pages": [1],
+            "gold_answer": "2022 年时，美国为 46%，中国为 27%。",
+        },
+        {
+            "id": "2",
+            "kind": "literal",
+            "tier": "A",
+            "question": "美国为多少？",
+            "gold_pages": [1],
+            "gold_answer": "2022 年时，美国为 46%，中国为 27%。",
+        },
+    ]
+    out, stats = refine_questions(items)
+    assert stats["bad_clause"] == 1
+    assert [i["id"] for i in out] == ["2"]
+
+
+def test_refine_drops_paraphrase_that_lost_its_subject():
+    same_q = "机构预估前三季度净利表现为多少？"
+    items = [
+        {"id": "1", "kind": "para", "tier": "S", "question": same_q, "gold_pages": [10], "gold_answer": ""},
+        {"id": "2", "kind": "para", "tier": "S", "question": same_q, "gold_pages": [20], "gold_answer": ""},
+    ]
+    out, stats = refine_questions(items)
+    assert stats["multi_conflict"] == 2 and out == []
+
+
+def test_refine_dedupes_identical_question_with_identical_gold():
+    q = "Thrust版本的预订意向金则达到多少？"
+    items = [
+        {"id": "1", "kind": "literal", "tier": "A", "question": q, "gold_pages": [10, 20], "gold_answer": q.replace("多少", "3 万元")},
+        {"id": "2", "kind": "literal", "tier": "A", "question": q, "gold_pages": [10, 20], "gold_answer": q.replace("多少", "3 万元")},
+    ]
+    out, stats = refine_questions(items)
+    assert stats["deduped"] == 1 and len(out) == 1
+
+
+def test_refine_merges_same_value_reports_from_different_pages():
+    q = "日经225指数收盘上涨多少？"
+    items = [
+        {
+            "id": "1", "kind": "literal", "tier": "A", "question": q,
+            "gold_pages": [10], "gold_span": [10, 11], "gold_figures": ["2.40"],
+            "gold_answer": "日经225指数收盘上涨2.40%，报69946.86点。",
+        },
+        {
+            "id": "2", "kind": "literal", "tier": "A", "question": q,
+            "gold_pages": [20], "gold_span": [20, 20], "gold_figures": ["2.40"],
+            "gold_answer": "日经225指数收盘上涨2.40%，报69946.86点。",
+        },
+    ]
+    out, stats = refine_questions(items)
+    assert stats["merged"] == 1 and len(out) == 1
+    assert out[0]["gold_pages"] == [10, 20]
+    assert out[0]["gold_spans"] == [[10, 11], [20, 20]]
+
+
+def test_timeline_gold_articles_align_with_gold_spans():
+    arts = [
+        Article(aid="A0001", title="智元机器人：发布新品", date="2026-10-01", frags=[(40, "x")]),
+        Article(aid="A0002", title="智元机器人，再获融资", date="2026-10-02", frags=[(30, "x")]),
+        Article(aid="A0003", title="智元机器人！出货量大增", date="2026-10-03", frags=[(50, "x")]),
+    ]
+    items = build_timeline_items(arts)
+    it = next(i for i in items if i["entity"] == "智元机器人")
+    assert it["gold_articles"] == ["A0001", "A0002", "A0003"]
+    assert it["gold_spans"] == [[40, 40], [30, 30], [50, 50]]

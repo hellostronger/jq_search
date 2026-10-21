@@ -206,8 +206,7 @@ def _paraphrase(q: str) -> str | None:
 
 def _figures(sent: str, m: re.Match) -> list[str]:
     core = re.findall(r"\d[\d,，.]*", m.group(0))
-    unit = bool(re.search(r"[%％元亿万美元倍]", m.group(0)))
-    return [c for c in dict.fromkeys(core) if len(re.sub(r"\D", "", c)) >= 2 or unit][:2]
+    return [c for c in dict.fromkeys(core)][:2]
 
 
 def build_factual_items(arts: list[Article], rng: random.Random) -> list[dict]:
@@ -243,6 +242,7 @@ def build_factual_items(arts: list[Article], rng: random.Random) -> list[dict]:
                 "gold_span": [min(p for p, _ in art.frags), max(p for p, _ in art.frags)],
                 "gold_answer": sent,
                 "gold_figures": _figures(sent, m),
+                "gold_match": m.group(0).strip(),
             }
             items.append({**base, "id": f"{art.aid}-p{page}-{_sid(q)}", "kind": "literal", "question": q})
             para_q = _paraphrase(q)
@@ -309,13 +309,24 @@ _VALUE = re.compile(r"[+\-]?\d[\d,，.]*\s*(?:%|％|万亿|亿|万|元|美元|�
 _SENT_SPLIT = re.compile(r"[。；;！？\n]")
 
 
+_NUM_PART = re.compile(r"[+\-]?\d[\d,，.]*")
+
+
 def _norm_value(v: str) -> str:
-    return re.sub(r"[,，.．\s]", "", v or "").lower()
+    """数值归一：42 与 4,220 必须区分开，2.40 与 2.4 视为同一个值。"""
+    m = _NUM_PART.search(v or "")
+    if not m:
+        return re.sub(r"\s", "", v or "").lower()
+    s = m.group(0).replace(",", "").replace("，", "")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s.lstrip("+")
 
 
 def _left_context(answer: str, figure: str) -> str:
     """取标准答案里数字前面的那半句，用它去别处找同一个问法。"""
-    idx = answer.find(figure)
+    m = re.search(rf"(?<![\d.．]){re.escape(figure)}(?![\d.．])", answer)
+    idx = m.start() if m else answer.find(figure)
     if idx < 0:
         return ""
     return _SENT_SPLIT.split(answer[max(0, idx - 48) : idx])[-1].strip()
@@ -330,7 +341,8 @@ def expand_duplicate_gold(items: list[dict], lows: list[str]) -> tuple[int, int]
     expanded = conflicted = 0
     for it in items:
         figs = it.get("gold_figures") or []
-        left = _left_context(it.get("gold_answer") or "", figs[0]) if figs else ""
+        anchor = it.get("gold_match") or (figs[0] if figs else "")
+        left = _left_context(it.get("gold_answer") or "", anchor) if anchor else ""
         if len(left) < 6:
             continue
         probe = left.lower()
@@ -347,7 +359,7 @@ def expand_duplicate_gold(items: list[dict], lows: list[str]) -> tuple[int, int]
                 m = _VALUE.match(tail)
                 if m:
                     value = _norm_value(m.group(0))
-                    if any(g and (g in value or value in g) for g in gold):
+                    if any(g and g == value for g in gold):
                         same.add(i)
                     else:
                         diff.add(i)
@@ -366,6 +378,64 @@ def expand_duplicate_gold(items: list[dict], lows: list[str]) -> tuple[int, int]
             it["gold_spans"] = ([span] if span else []) + [[p, p] for p in sorted(same)]
             expanded += 1
     return expanded, conflicted
+
+
+_CLEAN_TEXT = re.compile(r"[\s\-－—_：:，,。、|（）()『』“”\"'’]")
+
+
+def _norm_text(s: str) -> str:
+    return _CLEAN_TEXT.sub("", s or "").lower()
+
+
+def refine_questions(items: list[dict]) -> tuple[list[dict], dict[str, int]]:
+    """原句题的左半句必须真出现在标准答案里；同一问法对应不同答案说明丢了主体。
+
+    改写题会把"规模"写成"体量"，逐字对不上是正常的，所以只校验原句题；
+    同一问法命中多篇时，数值一致就把这些片段并进同一道题的 gold（重复报道），
+    数值冲突才剔除（问法里丢了主体，答案不唯一）。
+    """
+    kept = []
+    bad_clause = 0
+    for it in items:
+        if it["kind"] == "literal":
+            q = it["question"].rstrip("？?")
+            left = q[:-2] if q.endswith("多少") else ""
+            if len(left) >= 6 and _norm_text(left) not in _norm_text(it.get("gold_answer") or ""):
+                bad_clause += 1
+                continue
+        kept.append(it)
+    groups: dict[str, list[dict]] = {}
+    for it in kept:
+        groups.setdefault(_norm_text(it["question"]), []).append(it)
+    out = []
+    multi = merged = deduped = 0
+    for group in groups.values():
+        values = {tuple(sorted(_norm_value(f) for f in g.get("gold_figures") or [])) for g in group}
+        if len(values) > 1:
+            multi += len(group)
+            continue
+        base = group[0]
+        pages = sorted({p for g in group for p in g["gold_pages"]})
+        if len(group) > 1 and pages != sorted(base["gold_pages"]):
+            same_value = bool(base.get("gold_figures")) and len(values) == 1
+            if not same_value:
+                multi += len(group)
+                continue
+            spans = []
+            for g in group:
+                spans += g.get("gold_spans") or ([g["gold_span"]] if g.get("gold_span") else [])
+            base["gold_pages"] = pages
+            base["gold_spans"] = [list(s) for s in dict.fromkeys(tuple(s) for s in spans)]
+            merged += len(group) - 1
+        else:
+            deduped += len(group) - 1
+        out.append(base)
+    return out, {
+        "bad_clause": bad_clause,
+        "multi_conflict": multi,
+        "merged": merged,
+        "deduped": deduped,
+    }
 
 
 _GENERIC_TERMS = {
@@ -408,7 +478,7 @@ def build_timeline_items(arts: list[Article], min_arts: int = 3, cap: int = 220)
     """跨天聚合题：同一实体出现在多篇、多天文章的标题里，取最近 8 篇作为标准集。"""
     by_term: dict[str, list[Article]] = {}
     for art in arts:
-        for t in set(_title_terms(art)):
+        for t in dict.fromkeys(_title_terms(art)):
             by_term.setdefault(t, []).append(art)
     out = []
     for term, group in sorted(by_term.items(), key=lambda kv: -len(kv[1])):
@@ -420,7 +490,7 @@ def build_timeline_items(arts: list[Article], min_arts: int = 3, cap: int = 220)
             continue
         shown = sorted(uniq.values(), key=lambda a: a.date)[-8:]
         pages = sorted({p for a in shown for p, _ in a.frags})
-        spans = [(min(p for p, _ in a.frags), max(p for p, _ in a.frags)) for a in shown]
+        spans = [[min(p for p, _ in a.frags), max(p for p, _ in a.frags)] for a in shown]
         if not pages:
             continue
         out.append(
@@ -432,7 +502,7 @@ def build_timeline_items(arts: list[Article], min_arts: int = 3, cap: int = 220)
                 "entity": term,
                 "gold_pages": pages[:30],
                 "gold_spans": spans,
-                "gold_articles": sorted(a.aid for a in shown),
+                "gold_articles": [a.aid for a in shown],
                 "gold_answer": " / ".join(f"{a.date} {a.title[:28]}" for a in shown[:6]),
                 "gold_figures": [],
                 "lex_hit": True,
@@ -535,6 +605,7 @@ def build_dataset(
     expanded, conflicted = expand_duplicate_gold(facts, lows)
     dropped = sum(1 for i in facts if i["ambiguous"])
     facts = [i for i in facts if not i["ambiguous"]]
+    facts, refine = refine_questions(facts)
     timeline = build_timeline_items(arts)
     absent = build_absent_items(joined)
     items = quota(
@@ -554,6 +625,10 @@ def build_dataset(
         "candidate_ambiguous": dropped,
         "candidate_duplicate_gold": expanded,
         "candidate_duplicate_conflict": conflicted,
+        "candidate_bad_clause": refine["bad_clause"],
+        "candidate_multi_answer": refine["multi_conflict"],
+        "candidate_merged": refine["merged"],
+        "candidate_deduped": refine["deduped"],
         "candidate_a": sum(1 for i in facts if i["tier"] == "A"),
         "candidate_b": sum(1 for i in facts if i["tier"] == "B"),
         "candidate_s": sum(1 for i in facts if i["tier"] == "S"),

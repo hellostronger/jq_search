@@ -419,6 +419,8 @@ def api_query(payload: QueryPayload):
         raise HTTPException(400, str(e))
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
+    except Exception as e:  # noqa: BLE001 - 上游 LLM/网络错误要回传给界面
+        raise HTTPException(502, f"检索失败（上游模型或网络）：{e}")
 
 
 @app.get("/api/skeleton/{doc_id}")

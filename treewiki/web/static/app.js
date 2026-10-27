@@ -1470,7 +1470,7 @@ function renderOverview() {
     wikiChip.textContent = "已就绪";
     wikiChip.className = "status-chip wiki";
   } else {
-    wikiChip.textContent = "未生成 · M2";
+    wikiChip.textContent = "待蒸馏";
     wikiChip.className = "status-chip pending";
   }
 

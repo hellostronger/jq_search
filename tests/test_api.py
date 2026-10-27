@@ -5,6 +5,7 @@ import time
 from fastapi.testclient import TestClient
 
 from treewiki.core.store import KB
+from treewiki.core.wiki import WikiPage, WikiStore
 from treewiki.web import api
 
 
@@ -107,3 +108,53 @@ def test_pages_endpoint_caps_preview(tmp_path, monkeypatch):
     assert data["pages"][-1]["text"] == "p5"
     assert data["has_more"] is True
     assert client.get("/api/pages/src_9999").status_code == 404
+def test_generated_wiki_visible_in_overview(tmp_path, monkeypatch):
+    home = tmp_path / "kb"
+    home.mkdir()
+    monkeypatch.setattr(api, "kb_home", lambda: home)
+    kb = KB(home)
+    WikiStore(kb).save(
+        WikiPage(
+            id="ent_acme",
+            title="Acme",
+            type="entity",
+            description="一家公司",
+            sources=["src_0001"],
+            citations=[{"doc": "src_0001", "pages": [1], "claim": "收入 100 亿"}],
+        )
+    )
+    client = TestClient(api.app)
+
+    overview = client.get("/api/wiki/overview").json()
+    assert overview["status"] == "ready"
+    page = [p for p in overview["pages"] if p["id"] == "ent_acme"][0]
+    assert page["type"] == "entity" and page["citations"] == 1
+    detail = client.get(
+        "/api/wiki/page", params={"path": page["path"]}
+    ).json()
+    assert detail["meta"]["title"] == "Acme"
+    assert "关键事实" in detail["body"]
+
+
+def test_query_dispatch_modes(tmp_path, monkeypatch):
+    home = tmp_path / "kb"
+    home.mkdir()
+    monkeypatch.setattr(api, "kb_home", lambda: home)
+    client = TestClient(api.app)
+
+    assert client.post("/api/distill/src_9999").status_code == 404
+
+    captured = {}
+
+    def fake_query(question, kb, llm, cfg, mode=None, doc_id=None):
+        captured.update(question=question, mode=mode, doc_id=doc_id)
+        return {"answer": "ok", "citations": [], "usage": {}}
+
+    monkeypatch.setattr(api, "run_query", fake_query)
+    monkeypatch.setattr(api, "LLM", lambda cfg: object())
+
+    r = client.post("/api/query", json={"question": "收入?"})
+    assert r.status_code == 200 and captured == {"question": "收入?", "mode": None, "doc_id": None}
+    r = client.post("/api/query", json={"question": "收入?", "doc_id": "src_0001", "mode": "raw"})
+    assert r.status_code == 200
+    assert captured == {"question": "收入?", "mode": "raw", "doc_id": "src_0001"}

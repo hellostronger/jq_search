@@ -14,6 +14,7 @@ def test_ingest_markdown_bypasses_mineru(tmp_path, monkeypatch):
     )
     cfg = load_config(kb.home)
     cfg["index"]["summaries"] = False
+    cfg["wiki"]["enabled"] = False
 
     def boom(*args, **kwargs):
         raise AssertionError("md/txt 不应调用 MinerU")

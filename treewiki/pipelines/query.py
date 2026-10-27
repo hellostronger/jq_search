@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from ..core.entities import EntityIndex, normalize
 from ..core.llm import LLM
 from ..core.store import KB
 from ..core.tree import Node, TreeDoc, find_node, iter_nodes
+from ..core.wiki import WikiPage, WikiStore, render_body
 
 LOCALIZE_SYS = """你是文档检索专家，正在一棵文档树索引中定位答案位置（类似人类专家翻目录）。
 给你问题、文档描述和当前候选节点（含编号、标题、页范围、摘要及子节点）。
@@ -716,6 +718,7 @@ def query_raw(
     else:
         cited, cite_source = [], "none"
     return {
+        "mode": "raw",
         "doc_id": doc_id,
         "question": question,
         "resolved_question": resolved,
@@ -738,3 +741,415 @@ def query_raw(
         "rounds": trace,
         "usage": llm.usage(),
     }
+
+
+# --------------------------------------------------------------------- wiki 路
+
+WIKI_SELECT_SYS = """你是知识库检索专家。给你问题与 wiki 页面录（实体/主题/来源/分析页），选出最相关的页面。
+只输出 JSON：
+{{"pages": ["页面id"], "sufficient": true, "reason": "简短理由"}}
+- 最多选 {limit} 页，按相关度排序；优先能直接回答问题的页面。
+- 若目录中没有任何页面能支撑回答，sufficient 设为 false，pages 为空。
+- 页面 id 必须来自目录，不得编造。"""
+
+WIKI_ANSWER_SYS = """你是严谨的知识库问答助手。给你的 wiki 页是对来源文档的蒸馏，事实后标注了来源文档与页码。
+只能依据这些 wiki 页回答；输出 JSON：
+{"answer": "答案，引用处标注 [文档id:p页码]，例如：收入 247 亿美元 [src_0001:p1]", "citations": [{"doc": "src_0001", "pages": [1]}], "sufficient": true}
+如果 wiki 内容不足以回答（缺数据、粒度太粗、页标记 stale），sufficient 设为 false，并在 answer 中说明缺少什么。禁止编造。"""
+
+COMPARE_SYS = """你在核对两条问答结果：一条来自 wiki 蒸馏层，一条来自原始文档页。
+只输出 JSON：{"consistent": true, "note": "一致或关键差异（50 字内）"}
+- 数字、日期、主体、结论一致才算一致；表述差异不算冲突。"""
+
+_LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
+
+
+def _wiki_listing(pages: list[WikiPage], doc_id: str | None) -> str:
+    lines: list[str] = []
+    for p in pages[:120]:
+        scope = "来源" if p.type == "source" else (",".join(p.sources[:3]) or "—")
+        summary = (p.summary or p.description or "").replace("\n", " ")
+        line = f"[{p.id}] ({p.type} | {scope}) {p.title}"
+        if summary:
+            line += f" — {summary[:180]}"
+        lines.append(line)
+    if len(pages) > 120:
+        lines.append(f"… 另有 {len(pages) - 120} 页未列出")
+    if doc_id:
+        lines.insert(0, f"（当前问题聚焦文档：{doc_id}）")
+    return "\n".join(lines)
+
+
+def _wiki_scope(store: WikiStore, doc_id: str | None) -> list[WikiPage]:
+    pages = store.list()
+    if not doc_id:
+        return pages
+    scoped = [p for p in pages if doc_id in p.sources or p.id == doc_id]
+    return scoped if len(scoped) >= 3 else pages
+
+
+def _load_wiki_pages(
+    store: WikiStore, ids: list[str], limit: int, doc_id: str | None
+) -> list[WikiPage]:
+    out: list[WikiPage] = []
+    seen: set[str] = {p for p in ids}
+    for pid in ids:
+        if len(out) >= limit:
+            break
+        try:
+            out.append(store.load(pid))
+        except FileNotFoundError:
+            continue
+    # 沿 [[互链]] 扩一跳，优先同文档页
+    for page in list(out):
+        for link in _LINK_RE.findall(page.body or ""):
+            if len(out) >= limit:
+                break
+            if link in seen or link == page.id:
+                continue
+            try:
+                other = store.load(link)
+            except FileNotFoundError:
+                continue
+            seen.add(link)
+            out.append(other)
+    if doc_id:
+        out.sort(key=lambda p: 0 if doc_id in p.sources else 1)
+    return out
+
+
+def _wiki_context(pages: list[WikiPage], page_chars: int) -> str:
+    parts = []
+    for p in pages:
+        body = p.body.strip() or render_body(p)
+        if len(body) > page_chars:
+            body = body[:page_chars] + "…"
+        head = f"【wiki 页 {p.id} | {p.type} | {p.title}】"
+        if p.stale:
+            head += "（stale：内容可能过时）"
+        parts.append(f"{head}\n{body}")
+    return "\n\n".join(parts)
+
+
+def _cite_pool(pages: list[WikiPage]) -> dict[str, set[int]]:
+    pool: dict[str, set[int]] = {}
+    for p in pages:
+        for c in p.citations:
+            doc = str(c.get("doc") or "").strip()
+            if not doc:
+                continue
+            pages_set = pool.setdefault(doc, set())
+            for x in c.get("pages") or []:
+                try:
+                    pages_set.add(int(x))
+                except (TypeError, ValueError):
+                    continue
+    return pool
+
+
+_PAGE_REF_RE = re.compile(r"\[([A-Za-z0-9_\-]+)\s*:\s*p(\d+)")
+
+
+def _cites_from_text(text: str, pool: dict[str, set[int]]) -> list[dict]:
+    out: dict[str, set[int]] = {}
+    for doc, page in _PAGE_REF_RE.findall(text or ""):
+        n = int(page)
+        if doc in pool and n in pool[doc]:
+            out.setdefault(doc, set()).add(n)
+    return [{"doc_id": d, "pages": sorted(ps)} for d, ps in out.items()]
+
+
+def _norm_cites(raw: Any, pool: dict[str, set[int]], answer: str = "") -> list[dict]:
+    out: dict[str, set[int]] = {}
+    single = next(iter(pool)) if len(pool) == 1 else None
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                doc = str(item.get("doc") or item.get("doc_id") or single or "").strip()
+                pages = item.get("pages") or []
+            else:
+                doc, pages = single or "", [item]
+            if not doc or doc not in pool:
+                continue
+            for x in pages:
+                try:
+                    n = int(x)
+                except (TypeError, ValueError):
+                    continue
+                if n in pool[doc]:
+                    out.setdefault(doc, set()).add(n)
+    if out:
+        return [{"doc_id": d, "pages": sorted(ps)} for d, ps in out.items()]
+    # 结构化引用无效时，从答案正文的 [doc:pN] 标注提取
+    from_text = _cites_from_text(answer, pool)
+    if from_text:
+        return from_text
+    # 再退回 wiki 页自身的引用池（截断）
+    return [
+        {"doc_id": d, "pages": sorted(ps)[:8]}
+        for d, ps in pool.items()
+        if ps
+    ]
+
+
+def query_wiki(
+    question: str,
+    kb: KB,
+    llm: LLM,
+    cfg: dict,
+    doc_id: str | None = None,
+) -> dict:
+    """LLMWiki 式问答：选页 → 读 wiki 页（含一跳互链）→ 带 doc:page 引用作答。"""
+    qcfg = cfg["query"]
+    chat_model = cfg["llm"]["chat_model"]
+    store = WikiStore(kb)
+    pages = _wiki_scope(store, doc_id)
+    if not pages:
+        return {
+            "mode": "wiki",
+            "doc_id": doc_id or "",
+            "answer": "wiki 层还没有内容，请先摄取文档或运行 tw distill <doc_id>。",
+            "citations": [],
+            "wiki_pages": [],
+            "sufficient": False,
+            "rounds": [],
+            "usage": llm.usage(),
+        }
+
+    limit = int(qcfg.get("wiki_max_pages", 8))
+    data = llm.chat_json(
+        [
+            {"role": "system", "content": WIKI_SELECT_SYS.format(limit=limit)},
+            {
+                "role": "user",
+                "content": f"问题：{question}\n\nwiki 页面录：\n{_wiki_listing(pages, doc_id)}",
+            },
+        ],
+        model=chat_model,
+    )
+    pick = [x for x in (data.get("pages") or []) if isinstance(x, str)]
+    trace = [{"round": 1, "select": pick, "reason": data.get("reason", "")}]
+
+    if not pick or data.get("sufficient") is False:
+        return {
+            "mode": "wiki",
+            "doc_id": doc_id or "",
+            "answer": str(data.get("reason") or "wiki 层没有足够相关的页面。"),
+            "citations": [],
+            "wiki_pages": [],
+            "sufficient": False,
+            "rounds": trace,
+            "usage": llm.usage(),
+        }
+
+    read_pages = _load_wiki_pages(store, pick[:limit], limit + 3, doc_id)
+    context = _wiki_context(read_pages, int(qcfg.get("wiki_page_chars", 3000)))
+    answer = llm.chat_json(
+        [
+            {"role": "system", "content": WIKI_ANSWER_SYS},
+            {
+                "role": "user",
+                "content": f"问题：{question}\n\n可用的 wiki 页：\n\n{context}",
+            },
+        ],
+        model=chat_model,
+    )
+    answer_text = str(answer.get("answer", ""))
+    pool = _cite_pool(read_pages)
+    citations = _norm_cites(answer.get("citations"), pool, answer_text)
+    sufficient = bool(answer.get("sufficient", True))
+    if not sufficient:
+        citations = []
+    elif pool and not citations:
+        sufficient = False
+
+    return {
+        "mode": "wiki",
+        "doc_id": doc_id or "",
+        "answer": str(answer.get("answer", "")),
+        "citations": citations,
+        "wiki_pages": [
+            {"id": p.id, "title": p.title, "type": p.type, "stale": p.stale}
+            for p in read_pages
+        ],
+        "sufficient": sufficient and bool(citations),
+        "rounds": trace,
+        "usage": llm.usage(),
+    }
+
+
+# ------------------------------------------------------------------- 组合模式
+
+
+def _pick_doc(kb: KB, doc_id: str | None, wiki: dict) -> str | None:
+    if doc_id:
+        return doc_id
+    counts: dict[str, int] = {}
+    for c in wiki.get("citations") or []:
+        doc = c.get("doc_id")
+        if doc:
+            counts[doc] = counts.get(doc, 0) + len(c.get("pages") or [])
+    if counts:
+        return max(counts, key=counts.get)
+    sources = [k for k, v in kb.sources().items() if v.get("status") == "active"]
+    return sources[0] if len(sources) == 1 else None
+
+
+def query_cascade(
+    question: str,
+    kb: KB,
+    llm: LLM,
+    cfg: dict,
+    doc_id: str | None = None,
+) -> dict:
+    """默认模式：wiki 优先；不足或需要原始精度时下钻源树。"""
+    wiki = query_wiki(question, kb, llm, cfg, doc_id)
+    if wiki["sufficient"]:
+        return {**wiki, "mode": "cascade", "path": "wiki"}
+
+    target = _pick_doc(kb, doc_id, wiki)
+    if not target:
+        return {**wiki, "mode": "cascade", "path": "wiki"}
+
+    try:
+        raw = query_raw(target, question, kb, llm, cfg)
+    except FileNotFoundError:
+        if doc_id:
+            raise
+        return {**wiki, "mode": "cascade", "path": "wiki"}
+    return {
+        **raw,
+        "mode": "cascade",
+        "path": "raw",
+        "wiki_attempt": {
+            "answer": wiki["answer"],
+            "sufficient": wiki["sufficient"],
+            "citations": wiki["citations"],
+            "rounds": wiki["rounds"],
+        },
+    }
+
+
+def _merge_citations(*groups: list[dict]) -> list[dict]:
+    merged: dict[str, set[int]] = {}
+    for group in groups:
+        for c in group or []:
+            doc = str(c.get("doc_id") or c.get("doc") or "").strip()
+            if not doc:
+                continue
+            pages = merged.setdefault(doc, set())
+            for p in c.get("pages") or []:
+                try:
+                    pages.add(int(p))
+                except (TypeError, ValueError):
+                    continue
+    return [{"doc_id": d, "pages": sorted(ps)} for d, ps in merged.items()]
+
+
+def query_parallel(
+    question: str,
+    kb: KB,
+    llm: LLM,
+    cfg: dict,
+    doc_id: str | None = None,
+) -> dict:
+    """并行模式：wiki 与 raw 同时跑，对比答案，raw 为事实基准。"""
+    wiki_first: dict | None = None
+    target = doc_id
+    if not target:
+        wiki_first = query_wiki(question, kb, llm, cfg, doc_id)
+        target = _pick_doc(kb, None, wiki_first)
+        if not target:
+            return {
+                **wiki_first,
+                "mode": "parallel",
+                "answer": wiki_first["answer"] + "\n\n（无可下钻的源文档，仅返回 wiki 路）",
+                "verification": {"consistent": False, "note": "无源文档可对比"},
+            }
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        if wiki_first is not None:
+            wiki = wiki_first
+            raw = pool.submit(query_raw, target, question, kb, llm, cfg).result()
+        else:
+            fw = pool.submit(query_wiki, question, kb, llm, cfg, doc_id)
+            fr = pool.submit(query_raw, target, question, kb, llm, cfg)
+            wiki, raw = fw.result(), fr.result()
+
+    if not wiki.get("sufficient") or not wiki.get("answer"):
+        return {
+            "mode": "parallel",
+            "doc_id": raw.get("doc_id", ""),
+            "answer": raw["answer"] + "\n\n（wiki 路无可用内容，已跳过双路对比）",
+            "citations": raw.get("citations", []),
+            "wiki_pages": [],
+            "read_pages": raw.get("read_pages", []),
+            "read_nodes": raw.get("read_nodes", []),
+            "rounds": raw.get("rounds", []),
+            "verification": {"consistent": False, "note": "wiki 无可用内容"},
+            "wiki_answer": wiki.get("answer", ""),
+            "raw_answer": raw["answer"],
+            "usage": llm.usage(),
+        }
+
+    data = llm.chat_json(
+        [
+            {"role": "system", "content": COMPARE_SYS},
+            {
+                "role": "user",
+                "content": (
+                    f"问题：{question}\n\n"
+                    f"wiki 路答案：\n{wiki['answer']}\n\n"
+                    f"原始文档页答案：\n{raw['answer']}"
+                ),
+            },
+        ],
+        model=cfg["llm"]["chat_model"],
+    )
+    consistent = bool(data.get("consistent", False))
+    note = str(data.get("note") or "")
+    answer = raw["answer"]
+    if consistent:
+        answer += "\n\n（双路验证一致）"
+    else:
+        answer += f"\n\n（⚠️ 双路不一致：{note or '以原始文档为准'}；wiki 路答案：{wiki['answer']}）"
+
+    citations = _merge_citations(raw.get("citations"), wiki.get("citations"))
+
+    return {
+        "mode": "parallel",
+        "doc_id": raw.get("doc_id", ""),
+        "answer": answer,
+        "citations": citations,
+        "wiki_pages": wiki.get("wiki_pages", []),
+        "read_pages": raw.get("read_pages", []),
+        "read_nodes": raw.get("read_nodes", []),
+        "rounds": raw.get("rounds", []),
+        "verification": {"consistent": consistent, "note": note},
+        "wiki_answer": wiki["answer"],
+        "raw_answer": raw["answer"],
+        "usage": llm.usage(),
+    }
+
+
+def run_query(
+    question: str,
+    kb: KB,
+    llm: LLM,
+    cfg: dict,
+    mode: str | None = None,
+    doc_id: str | None = None,
+) -> dict:
+    """统一入口：raw / wiki / cascade（默认） / parallel。"""
+    mode = (mode or cfg["query"].get("mode") or "cascade").lower()
+    if mode == "raw":
+        if not doc_id:
+            raise ValueError("raw 模式需要指定 doc_id")
+        return query_raw(doc_id, question, kb, llm, cfg)
+    if mode == "wiki":
+        return query_wiki(question, kb, llm, cfg, doc_id)
+    if mode == "cascade":
+        return query_cascade(question, kb, llm, cfg, doc_id)
+    if mode == "parallel":
+        return query_parallel(question, kb, llm, cfg, doc_id)
+    raise ValueError(f"未知查询模式: {mode}（可选 raw/wiki/cascade/parallel）")

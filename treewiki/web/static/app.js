@@ -115,7 +115,6 @@ function switchTab(name) {
 function syncSelects() {
   const doc = state.currentDoc || "";
   if ($("source_select").value !== doc) $("source_select").value = doc;
-  if ($("query_doc").value !== doc) $("query_doc").value = doc;
 }
 
 function updateTopStatus() {
@@ -209,19 +208,27 @@ async function loadSources() {
 }
 
 function renderSourceSelects() {
-  for (const id of ["source_select", "query_doc"]) {
-    const select = $(id);
-    const prev = state.currentDoc || select.value;
-    select.replaceChildren();
-    if (!state.sources.length) {
-      select.append(h("option", { value: "" }, "暂无文档"));
-      continue;
-    }
+  const select = $("source_select");
+  const prev = state.currentDoc || select.value;
+  select.replaceChildren();
+  if (!state.sources.length) {
+    select.append(h("option", { value: "" }, "暂无文档"));
+  } else {
     for (const source of state.sources) {
       select.append(h("option", { value: source.doc_id }, `${source.doc_id} · ${source.name}`));
     }
     if (prev && state.sources.some((s) => s.doc_id === prev)) select.value = prev;
   }
+
+  const query = $("query_doc");
+  const queryPrev = query.dataset.init ? query.value : (state.currentDoc || "");
+  query.replaceChildren(h("option", { value: "" }, "全部文档（跨文档检索）"));
+  for (const source of state.sources) {
+    query.append(h("option", { value: source.doc_id }, `${source.doc_id} · ${source.name}`));
+  }
+  if (queryPrev && state.sources.some((s) => s.doc_id === queryPrev)) query.value = queryPrev;
+  query.dataset.init = "1";
+
   syncSelects();
 }
 
@@ -229,7 +236,7 @@ function renderSourcesTable() {
   const tbody = $("sources_table");
   tbody.replaceChildren();
   if (!state.sources.length) {
-    tbody.append(h("tr", {}, h("td", { colspan: "6", class: "muted" }, "暂无来源，上传一个文档开始。")));
+    tbody.append(h("tr", {}, h("td", { colspan: "7", class: "muted" }, "暂无来源，上传一个文档开始。")));
     return;
   }
   for (const source of state.sources) {
@@ -242,9 +249,55 @@ function renderSourcesTable() {
       h("td", {}, fmtNum(source.nodes)),
       h("td", { class: "muted" }, fmtDate(source.ingested_at)),
       h("td", {}, h("span", { class: `status-chip ${source.status === "active" ? "ok" : ""}` }, source.status || "—")),
+      h("td", {}, distillButton(source.doc_id)),
     );
     row.addEventListener("click", () => selectDoc(source.doc_id));
     tbody.append(row);
+  }
+}
+
+function distillButton(docId) {
+  const button = h("button", { class: "btn secondary small", type: "button" }, "蒸馏");
+  button.title = "对这篇来源重跑 LLMWiki 蒸馏（实体/主题/关系/来源页）";
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    distillSource(docId, button);
+  });
+  return button;
+}
+
+async function distillSource(docId, button) {
+  button.disabled = true;
+  button.textContent = "蒸馏中…";
+  try {
+    const { job_id } = await api(`/api/distill/${encodeURIComponent(docId)}`, { method: "POST" });
+    const tick = async () => {
+      try {
+        const job = await api(`/api/jobs/${job_id}`);
+        if (job.status === "done") {
+          button.disabled = false;
+          button.textContent = "蒸馏";
+          toast(`${docId} 蒸馏完成：${(job.stages || []).slice(-1)[0] || "已写入 wiki"}`);
+          await loadWiki();
+          await loadSources();
+        } else if (job.status === "error") {
+          button.disabled = false;
+          button.textContent = "重试蒸馏";
+          toast(`${docId} 蒸馏失败：${job.error}`);
+        } else {
+          state.distillTimer = setTimeout(tick, 2000);
+        }
+      } catch (e) {
+        button.disabled = false;
+        button.textContent = "重试蒸馏";
+        toast(`蒸馏轮询失败：${e.message}`);
+      }
+    };
+    tick();
+  } catch (e) {
+    button.disabled = false;
+    button.textContent = "重试蒸馏";
+    toast(`启动蒸馏失败：${e.message}`);
   }
 }
 
@@ -652,9 +705,10 @@ async function uploadFile() {
 
 async function runQuery() {
   const docId = $("query_doc").value;
+  const mode = $("query_mode").value || "cascade";
   const question = $("query_text").value.trim();
-  if (!docId) {
-    setMsg($("query_msg"), "没有可选文档", true);
+  if (mode === "raw" && !docId) {
+    setMsg($("query_msg"), "raw 模式需要选择一个具体文档；跨文档检索请用 cascade / wiki / parallel", true);
     return;
   }
   if (!question) {
@@ -663,24 +717,40 @@ async function runQuery() {
   }
   const button = $("btn_query");
   button.disabled = true;
-  setMsg($("query_msg"), "树遍历检索中，可能需要几十秒…");
+  const running = {
+    wiki: "读取 Wiki 知识页并作答中…",
+    raw: "树遍历检索中，可能需要几十秒…",
+    cascade: "Wiki 优先检索中，不足时自动下钻源树…",
+    parallel: "Wiki 路与源树路并行检索并核验中…",
+  }[mode] || "检索中…";
+  setMsg($("query_msg"), running);
   const resultBox = $("query_result");
   resultBox.classList.remove("hidden");
-  resultBox.replaceChildren(h("div", { class: "card" }, loading("LLM 正在树上定位并作答…")));
+  resultBox.replaceChildren(h("div", { class: "card" }, loading(running)));
   try {
-    if (state.currentDoc !== docId || state.tree?.doc_id !== docId) {
+    if (mode === "raw" && docId && (state.currentDoc !== docId || state.tree?.doc_id !== docId)) {
       state.currentDoc = docId;
       syncSelects();
       await loadTree(docId);
     }
+    const payload = { question, mode };
+    if (docId) payload.doc_id = docId;
     const r = await api("/api/query", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ doc_id: docId, question, mode: "raw" }),
+      body: JSON.stringify(payload),
     });
-    renderQueryResult(r, docId);
+    const focusDoc = docId || r.doc_id || state.currentDoc;
+    renderQueryResult(r, focusDoc);
     $("query_intro").classList.add("hidden");
-    setMsg($("query_msg"), `完成：${r.rounds.length} 轮定位，读取 ${r.read_nodes.length} 个节点 / ${r.read_pages.length} 页`);
+    const rounds = (r.rounds || []).length;
+    const nodes = (r.read_nodes || []).length;
+    const pages = (r.read_pages || []).length;
+    const cites = (r.citations || []).reduce((sum, c) => sum + (c.pages || []).length, 0);
+    setMsg(
+      $("query_msg"),
+      `完成：${r.mode || mode}${r.path ? ` · ${r.path}` : ""}，${rounds} 轮定位 / ${nodes} 节点 / ${pages} 页 / ${cites} 条引用`,
+    );
   } catch (e) {
     resultBox.replaceChildren(h("div", { class: "error-box" }, `问答失败：${e.message}`));
     setMsg($("query_msg"), "失败", true);
@@ -737,9 +807,45 @@ function provStep(label, value, highlight = false) {
   return h("div", { class: `prov-step${highlight ? " highlight" : ""}` }, h("small", {}, label), h("strong", {}, value));
 }
 
+function wikiPagePath(pageId) {
+  const page = state.wiki?.pages?.find((p) => p.id === pageId);
+  return page?.path || null;
+}
+
+function wikiPageChip(page) {
+  const chip = h("span", { class: "node-pill clickable" }, `${page.title || page.id} · ${page.type}`);
+  chip.title = "在 Wiki 视图中打开该页";
+  chip.addEventListener("click", () => {
+    const path = wikiPagePath(page.id);
+    switchTab("wiki");
+    if (path) openWikiPage(path);
+  });
+  return chip;
+}
+
+function citationChips(citations, forceDoc) {
+  const docs = new Set(citations.map((c) => c.doc_id).filter(Boolean));
+  const multi = forceDoc || docs.size > 1;
+  const chips = [];
+  for (const citation of citations) {
+    for (const page of citation.pages || []) {
+      chips.push(
+        h("span", { class: "cite-chip" }, multi ? `${citation.doc_id}:p${page}` : `p${page}`),
+      );
+    }
+  }
+  return chips;
+}
+
 function renderQueryResult(r, docId) {
   const box = $("query_result");
-  const pages = r.citations?.[0]?.pages || [];
+  const mode = r.mode || "raw";
+  const path = r.path || null;
+  const rounds = r.rounds || [];
+  const readNodes = r.read_nodes || [];
+  const readPages = r.read_pages || [];
+  const citations = r.citations || [];
+  const wikiPages = r.wiki_pages || [];
   const usage = r.usage || {};
   const citationLabel = { model: "模型返回页码", text: "从 [pX] 解析", none: "无引用" }[r.citation_source] || r.citation_source;
   const fallbackLabel = {
@@ -747,27 +853,43 @@ function renderQueryResult(r, docId) {
     spread_sample: "定位未命中，均匀抽样叶节点",
     summary_only: "仅依据摘要作答",
   }[r.fallback] || r.fallback;
+  const modeLabel = {
+    wiki: "wiki · 只读知识页",
+    raw: "raw · 源树遍历",
+    cascade: `cascade · ${path === "raw" ? "wiki 不足 → 下钻源树" : "命中 Wiki 页"}`,
+    parallel: "parallel · 双路 + 核验",
+  }[mode] || mode;
 
   const citationRow = h(
     "div",
     { class: "citation-row" },
     h("span", { class: "muted" }, "引用页："),
-    pages.length ? pages.map((p) => h("span", { class: "cite-chip" }, `p${p}`)) : h("span", { class: "status-chip pending" }, "无页级引用"),
+    citations.length
+      ? citationChips(citations, !r.doc_id)
+      : h("span", { class: "status-chip pending" }, "无页级引用"),
   );
 
-  const provenance = h(
-    "div",
-    { class: "provenance" },
-    provStep("问题", "用户输入"),
-    h("span", { class: "prov-arrow" }, "→"),
-    provStep("树定位", `${r.rounds.length} 轮`, true),
-    h("span", { class: "prov-arrow" }, "→"),
-    provStep("读取节点", `${r.read_nodes.length} 个`),
-    h("span", { class: "prov-arrow" }, "→"),
-    provStep("原文页", `${r.read_pages.length} 页`, true),
-    h("span", { class: "prov-arrow" }, "→"),
-    provStep("答案", r.answer_status === "ok" ? "已生成" : "空"),
-  );
+  const steps = [provStep("问题", "用户输入")];
+  if (mode === "wiki" || (mode === "cascade" && path !== "raw")) {
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("Wiki 页", `${wikiPages.length} 页`, true));
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("蒸馏答案", r.answer ? "已生成" : "空"));
+  } else if (mode === "cascade") {
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("Wiki 未覆盖", "已尝试", true));
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("树定位", `${rounds.length} 轮`));
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("原文页", `${readPages.length} 页`, true));
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("答案", r.answer ? "已生成" : "空"));
+  } else if (mode === "parallel") {
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("Wiki 路", `${wikiPages.length} 页`));
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("源树路", `${readPages.length} 页`, true));
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("一致性核验", r.verification ? (r.verification.consistent ? "一致" : "有差异") : "未执行"));
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("答案", r.answer ? "已生成" : "空"));
+  } else {
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("树定位", `${rounds.length} 轮`, true));
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("读取节点", `${readNodes.length} 个`));
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("原文页", `${readPages.length} 页`, true));
+    steps.push(h("span", { class: "prov-arrow" }, "→"), provStep("答案", r.answer ? "已生成" : "空"));
+  }
+  const provenance = h("div", { class: "provenance" }, ...steps);
 
   const answerCard = h(
     "article",
@@ -779,22 +901,60 @@ function renderQueryResult(r, docId) {
       h(
         "div",
         { class: "meta-badges" },
-        h("span", { class: `status-chip ${r.answer_status === "ok" ? "ok" : "pending"}` }, r.answer_status === "ok" ? "已生成" : "空答案"),
-        h("span", { class: "status-chip" }, citationLabel),
+        h("span", { class: `status-chip ${r.answer ? "ok" : "pending"}` }, r.answer ? "已生成" : "空答案"),
+        h("span", { class: "status-chip wiki" }, modeLabel),
+        citationLabel ? h("span", { class: "status-chip" }, citationLabel) : null,
       ),
     ),
     renderAnswerText(r.answer || "（无答案）"),
     citationRow,
     provenance,
+    wikiPages.length
+      ? h(
+          "div",
+          { class: "citation-row" },
+          h("span", { class: "muted" }, "Wiki 来源页："),
+          wikiPages.map((page) => wikiPageChip(page)),
+        )
+      : null,
+    r.verification
+      ? h(
+          "div",
+          { class: "note" },
+          `双路核验：${r.verification.consistent ? "一致" : "存在差异"}${r.verification.note ? ` · ${r.verification.note}` : ""}`,
+        )
+      : null,
+    r.wiki_attempt
+      ? h(
+          "div",
+          { class: "note" },
+          `Wiki 路判定${r.wiki_attempt.sufficient ? "充分" : "证据不足"}，已下钻源树作答。Wiki 路答案：${r.wiki_attempt.answer || "（空）"}`,
+        )
+      : null,
     h(
       "div",
       { class: "meta-badges" },
-      h("span", { class: "badge" }, fallbackLabel),
+      h("span", { class: "badge" }, `模式 ${mode}`),
+      r.fallback ? h("span", { class: "badge" }, fallbackLabel) : null,
       h("span", { class: "badge" }, `LLM 调用 ${usage.calls ?? 0}`),
       h("span", { class: "badge" }, `prompt ${fmtNum(usage.prompt_tokens)} tokens`),
       h("span", { class: "badge" }, `completion ${fmtNum(usage.completion_tokens)} tokens`),
     ),
   );
+
+  const cards = [answerCard];
+
+  if (mode === "parallel" || r.wiki_answer || r.raw_answer) {
+    const compare = h("article", { class: "card" });
+    compare.append(
+      h("div", { class: "card-head" }, h("div", {}, h("span", { class: "eyebrow" }, "TWO PATHS"), h("h3", {}, "两路答案对照"))),
+      h("h4", {}, "Wiki 路"),
+      renderAnswerText(r.wiki_answer || "（无）"),
+      h("h4", {}, "源树 raw 路"),
+      renderAnswerText(r.raw_answer || "（无）"),
+    );
+    cards.push(compare);
+  }
 
   const traceCard = h("article", { class: "card" });
   traceCard.append(
@@ -805,9 +965,9 @@ function renderQueryResult(r, docId) {
       h(
         "div",
         { class: "meta-badges" },
-        h("span", { class: "badge" }, `模式 raw`),
-        h("span", { class: "badge" }, `读取页 ${r.read_pages.length}`),
-        h("span", { class: "badge" }, `读取节点 ${r.read_nodes.length}`),
+        h("span", { class: "badge" }, `模式 ${mode}`),
+        h("span", { class: "badge" }, `读取页 ${readPages.length}`),
+        h("span", { class: "badge" }, `读取节点 ${readNodes.length}`),
         r.lexical?.pages?.length
           ? h("span", { class: "status-chip ok" }, `字面命中 ${r.lexical.pages.length} 页`)
           : null,
@@ -815,56 +975,74 @@ function renderQueryResult(r, docId) {
     ),
   );
 
-  if (r.rounds?.length) {
-    const timeline = h("div", { class: "timeline" });
-    for (const round of r.rounds) {
-      const actions = h("div", {});
-      if (round.expand?.length) {
-        actions.append(
-          h(
-            "div",
-            { class: "action-line" },
-            h("span", { class: "action-tag expand" }, "EXPAND"),
-            round.expand.map((id) => nodePill(docId, id)),
-          ),
-        );
-      }
-      if (round.read?.length) {
-        actions.append(
-          h(
-            "div",
-            { class: "action-line" },
-            h("span", { class: "action-tag read" }, "READ"),
-            round.read.map((id) => nodePill(docId, id)),
-          ),
-        );
-      }
-      if (!round.expand?.length && !round.read?.length) {
-        actions.append(h("div", { class: "action-line muted" }, "本轮没有有效动作"));
-      }
-      timeline.append(
+  const timelineRows = [];
+  for (const round of rounds) {
+    const actions = h("div", {});
+    if (round.expand?.length) {
+      actions.append(
         h(
           "div",
-          { class: "round-card" },
-          h(
-            "div",
-            { class: "round-head" },
-            h("span", { class: "round-num" }, `ROUND ${round.round}`),
-            h("span", { class: "round-reason" }, round.reason || "无说明"),
-            round.attempts > 1 ? h("span", { class: "status-chip pending" }, `${round.attempts} 次尝试`) : null,
-          ),
-          actions,
+          { class: "action-line" },
+          h("span", { class: "action-tag expand" }, "EXPAND"),
+          round.expand.map((id) => nodePill(docId, id)),
         ),
       );
     }
-    traceCard.append(h("div", { class: "rounds" }, h("h4", {}, "逐轮决策"), timeline));
+    if (round.read?.length) {
+      actions.append(
+        h(
+          "div",
+          { class: "action-line" },
+          h("span", { class: "action-tag read" }, "READ"),
+          round.read.map((id) => nodePill(docId, id)),
+        ),
+      );
+    }
+    if (!round.expand?.length && !round.read?.length) {
+      actions.append(h("div", { class: "action-line muted" }, "本轮没有有效动作"));
+    }
+    timelineRows.push(
+      h(
+        "div",
+        { class: "round-card" },
+        h(
+          "div",
+          { class: "round-head" },
+          h("span", { class: "round-num" }, `ROUND ${round.round}`),
+          h("span", { class: "round-reason" }, round.reason || "无说明"),
+          round.attempts > 1 ? h("span", { class: "status-chip pending" }, `${round.attempts} 次尝试`) : null,
+        ),
+        actions,
+      ),
+    );
+  }
+
+  if (timelineRows.length) {
+    traceCard.append(h("div", { class: "rounds" }, h("h4", {}, "逐轮决策"), h("div", { class: "timeline" }, timelineRows)));
+  } else if (wikiPages.length) {
+    const list = h("div", { class: "read-nodes" }, h("h4", {}, "Wiki 选页"));
+    for (const page of wikiPages) {
+      list.append(
+        h(
+          "div",
+          { class: "read-node-row" },
+          h("strong", {}, page.title || page.id),
+          h("span", { class: "node-pill" }, page.id),
+          h("span", { class: "page-range" }, page.type || ""),
+          page.stale ? h("span", { class: "status-chip pending" }, "stale") : null,
+        ),
+      );
+    }
+    traceCard.append(list);
+  } else if (mode === "wiki" || (mode === "cascade" && path !== "raw")) {
+    traceCard.append(h("div", { class: "empty-inline" }, r.answer || "wiki 层没有足够相关的页面。"));
   } else {
     traceCard.append(h("div", { class: "empty-inline" }, "本次没有产生定位轮次。"));
   }
 
-  if (r.read_nodes?.length) {
+  if (readNodes.length) {
     const list = h("div", { class: "read-nodes" }, h("h4", {}, "实际读取的节点"));
-    for (const node of r.read_nodes) {
+    for (const node of readNodes) {
       const row = h(
         "div",
         { class: "read-node-row" },
@@ -878,24 +1056,24 @@ function renderQueryResult(r, docId) {
     traceCard.append(list);
   }
 
-  const raw = { rounds: r.rounds, read_nodes: r.read_nodes, read_pages: r.read_pages, lexical: r.lexical, fallback: r.fallback, citation_source: r.citation_source, usage: r.usage };
   traceCard.append(
     h(
       "details",
       { class: "raw-details" },
       h("summary", {}, "查看原始产物 JSON"),
-      h("pre", {}, JSON.stringify(raw, null, 2)),
+      h("pre", {}, JSON.stringify(r, null, 2)),
     ),
     h(
       "div",
       { class: "note" },
       r.lexical?.pages?.length
         ? `字面命中：问题关键词 ${r.lexical.terms.map((t) => `「${t}」`).join("")} 直接命中的页已作为证据注入，不依赖模型选对分支。引用页只来自本次实际读取的原文页。`
-        : "引用页只来自本次实际读取的原文页。点击节点可以回到源树查看摘要与原文；当前为 raw 单路模式。",
+        : "引用页只来自本次实际读取的原文页或 wiki 页声明的 claim 来源。",
     ),
   );
 
-  box.replaceChildren(answerCard, traceCard);
+  cards.push(traceCard);
+  box.replaceChildren(...cards);
   box.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -956,13 +1134,13 @@ function renderWiki() {
           {},
           h("span", { class: "status-chip pending" }, "LLMWiki 尚无产物"),
           h("h3", {}, "当前知识库只有 PageIndex 源树"),
-          h("p", {}, error ? `读取 Wiki 失败：${error}` : "kb/wiki 目录为空。M2 生成后将自动在此展示真实知识页，不使用演示数据。"),
+          h("p", {}, error ? `读取 Wiki 失败：${error}` : "kb/wiki 目录为空。摄取完成后会自动蒸馏；也可在来源表点「蒸馏」重跑。M2 生成后将在此展示真实知识页，不使用演示数据。"),
         ),
         h(
           "div",
           { class: "meta-badges" },
           h("span", { class: "badge" }, "M1：PageIndex 已运行"),
-          h("span", { class: "badge" }, "M2：Wiki 层待接入"),
+          h("span", { class: "badge" }, "M2：Wiki 蒸馏已接入"),
         ),
       ),
     );
@@ -1331,9 +1509,9 @@ function renderArtifacts() {
     artifactRow("节点摘要", "PageIndex", "摄取时", totalNodes ? `已生成 · ${fmtNum(totalNodes)} 节点` : "未生成", totalNodes ? "ok" : "pending", "随源树 JSON 落盘"),
     artifactRow("定位轨迹", "PageIndex", "每次问答", hasSources ? "运行时生成" : "待摄取", hasSources ? "ok" : "pending", "answer.rounds"),
     artifactRow("页级引用", "PageIndex", "每次问答", hasSources ? "运行时生成" : "待摄取", hasSources ? "ok" : "pending", "answer.citations[].pages"),
-    artifactRow("Wiki 知识页", "LLMWiki", "M2 摄取蒸馏", wikiReady ? `已生成 · ${fmtNum(wikiPages)} 页` : "未生成（M2）", wikiReady ? "wiki" : "pending", "kb/wiki/{entities,topics,sources,analyses}/"),
-    artifactRow("目录与时间线", "LLMWiki", "M2", specialCount ? `已生成 · ${specialCount} 个` : "未生成（M2）", specialCount ? "wiki" : "pending", "kb/wiki/index.md · log.md"),
-    artifactRow("Wiki 树", "LLMWiki", "M2/M3", wikiTree ? "已生成" : "未生成（M2/M3）", wikiTree ? "wiki" : "pending", "kb/index/wiki_tree.json"),
+    artifactRow("Wiki 知识页", "LLMWiki", "摄取蒸馏（M2）", wikiReady ? `已生成 · ${fmtNum(wikiPages)} 页` : "未生成（可蒸馏）", wikiReady ? "wiki" : "pending", "kb/wiki/{entities,topics,sources,analyses}/"),
+    artifactRow("目录与时间线", "LLMWiki", "蒸馏写入（M2）", specialCount ? `已生成 · ${specialCount} 个` : "未生成（可蒸馏）", specialCount ? "wiki" : "pending", "kb/wiki/index.md · log.md"),
+    artifactRow("Wiki 树", "LLMWiki", "蒸馏写入（M3 检索）", wikiTree ? "已生成" : "未生成（可蒸馏）", wikiTree ? "wiki" : "pending", "kb/index/wiki_tree.json"),
   );
 }
 
@@ -1348,7 +1526,6 @@ function bindEvents() {
   });
 
   $("source_select").addEventListener("change", (e) => selectDoc(e.target.value));
-  $("query_doc").addEventListener("change", (e) => selectDoc(e.target.value, { load: false }));
 
   $("tree_search").addEventListener("input", () => {
     clearTimeout(state.searchTimer);

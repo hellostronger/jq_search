@@ -12,9 +12,11 @@ from .core.entities import normalize
 from .core.llm import LLM
 from .core.store import KB
 from .core.tree import iter_nodes, skeleton_text
+from .core.wiki import WikiStore
+from .pipelines.distill import distill_source
 from .pipelines.entities import build_entities
 from .pipelines.ingest import ingest_file
-from .pipelines.query import query_raw
+from .pipelines.query import run_query
 
 app = typer.Typer(no_args_is_help=True, help="TreeWiki — LLMWiki × PageIndex 知识库")
 entities_app = typer.Typer(no_args_is_help=True, help="实体别名索引（图聚类）")
@@ -45,16 +47,65 @@ def ingest(
 @app.command()
 def query(
     question: str,
-    doc: str = typer.Option(..., help="doc_id，如 src_0001"),
+    doc: Optional[str] = typer.Option(None, "--doc", "-d", help="doc_id，如 src_0001"),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="raw | wiki | cascade（默认） | parallel"
+    ),
+    trace: bool = typer.Option(False, "--show-trace", help="打印定位轨迹"),
 ):
-    """树遍历问答（raw 路）"""
+    """问答（默认 cascade：wiki 优先，不足下钻源树）"""
     cfg = load_config()
     llm = LLM(cfg)
-    result = query_raw(doc, question, KB(kb_home()), llm, cfg)
+    result = run_query(question, KB(kb_home()), llm, cfg, mode=mode, doc_id=doc)
     console.print(result["answer"])
-    pages = (result["citations"][0]["pages"] if result["citations"] else [])
-    console.print(f"[dim]引用页: {pages} | 定位轮数: {len(result['rounds'])} | "
-                  f"LLM 调用: {result['usage']['calls']}[/dim]")
+    cites = " ".join(
+        f"{c.get('doc_id')}:p{','.join(str(p) for p in c.get('pages') or [])}"
+        for c in result.get("citations") or []
+    ) or "无"
+    console.print(f"[dim]模式: {result.get('mode')} | 路径: {result.get('path', '-')} | "
+                  f"引用: {cites} | LLM 调用: {result['usage']['calls']}[/dim]")
+    if trace:
+        import json
+
+        console.print_json(json.dumps(result, ensure_ascii=False, default=str))
+
+
+@app.command()
+def distill(doc_id: str):
+    """对已有来源重跑 wiki 蒸馏（实体/主题/关系/来源页）"""
+    cfg = load_config()
+    kb = KB(kb_home())
+    stats = distill_source(doc_id, kb, LLM(cfg), cfg, stage=console.print)
+    console.print(
+        f"[green]完成：实体 {stats['entities']} ｜ 主题 {stats['topics']} ｜ "
+        f"关系 {stats['relations']} ｜ wiki 页 {stats['pages']}"
+        + (f" ｜ 失败批次 {stats['failed']}" if stats.get("failed") else "")
+        + "[/green]"
+    )
+
+
+@app.command("wiki")
+def wiki_cmd(
+    page_id: Optional[str] = typer.Argument(None, help="页面 id；省略则列出全部"),
+):
+    """浏览 wiki 页"""
+    store = WikiStore(KB(kb_home()))
+    if page_id:
+        page = store.load(page_id)
+        console.print(f"[bold]{page.title}[/bold] [dim]({page.type} | {page.id})[/dim]")
+        if page.tags:
+            console.print(f"[dim]tags: {', '.join(page.tags)}[/dim]")
+        console.print(page.body or "")
+        return
+    table = Table(title=f"Wiki {store.root}")
+    table.add_column("id")
+    table.add_column("类型")
+    table.add_column("标题")
+    table.add_column("来源")
+    table.add_column("更新")
+    for p in store.list():
+        table.add_row(p.id, p.type, p.title, ", ".join(p.sources), p.updated)
+    console.print(table)
 
 
 @app.command()
@@ -77,6 +128,13 @@ def status():
             str(n_nodes), info.get("status", ""),
         )
     console.print(table)
+    store = WikiStore(kb)
+    pages = store.list()
+    by_type: dict[str, int] = {}
+    for p in pages:
+        by_type[p.type] = by_type.get(p.type, 0) + 1
+    summary = " ｜ ".join(f"{k} {v}" for k, v in sorted(by_type.items())) or "暂无"
+    console.print(f"[dim]wiki 页: {len(pages)}（{summary}）[/dim]")
 
 
 @app.command()

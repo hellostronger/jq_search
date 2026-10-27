@@ -26,6 +26,12 @@ DEFAULTS: dict[str, Any] = {
         "classic_batch": 8,
         "summary_workers": 6,
     },
+    "wiki": {
+        "enabled": True,
+        "leaf_chars": 3000,
+        "batch_chars": 9000,
+        "max_batches": 30,
+    },
     "query": {
         "mode": "cascade",
         "max_rounds": 4,
@@ -35,6 +41,8 @@ DEFAULTS: dict[str, Any] = {
         "answer_attempts": 3,
         "summary_chars": 6000,
         "lexical_pages": 12,
+        "wiki_max_pages": 8,
+        "wiki_page_chars": 3000,
     },
     "entities": {
         "enabled": True,

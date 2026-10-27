@@ -2,7 +2,7 @@
 
 LLMWiki × PageIndex 融合知识库系统（设计见 [docs/DESIGN.md](docs/DESIGN.md)）。
 
-当前进度：**M1 检索内核** —— MinerU 解析 → 树索引构建 → 树遍历问答（页级引用）+ Web 界面。
+当前进度：**M2 wiki 蒸馏层** —— MinerU 解析 → 树索引 → wiki 蒸馏（实体/主题/关系/来源页）→ 四种查询模式（cascade / wiki / raw / parallel）+ Web 界面。
 
 ## 快速开始
 
@@ -16,16 +16,22 @@ tw serve                       # 打开 http://127.0.0.1:8000
 
 Web 页面操作：
 1. **设置**：填 LLM（OpenAI 兼容 base_url / api_key / 双模型）与 MinerU 云 API token，点「测试连接」；
-2. **文档**：上传 PDF/Word（MinerU 解析）或 md/txt（本地解析），可附一句补充描述（如“v1.0 平台部署文档”）→ 自动建树（进度轮询）；
-3. **问答**：选文档、提问 → 答案带页级引用与定位轨迹。
+2. **文档**：上传 PDF/Word（MinerU 解析）或 md/txt（本地解析），可附一句补充描述（如“v1.0 平台部署文档”）→ 自动建树并蒸馏 wiki（进度轮询）；已有来源可点「蒸馏」重建；
+3. **Wiki 知识层**：浏览/筛选实体、主题、来源、分析页，查看 `[[互链]]`、关键事实与页级引用；
+4. **问答**：选择模式（cascade 默认 / wiki / raw / parallel）与文档（可跨文档），答案带 `doc:p` 引用与检索轨迹。
+
+wiki 产物：`kb/wiki/{entities,topics,sources,analyses}/*.md`、`kb/wiki/index.md`、`kb/wiki/log.md`、`kb/index/wiki_tree.json`。页面 frontmatter 含 `citations`（doc + pages + claim）与 typed `relations`（predicate + target + pages），正文用 `[[页面id]]` 互链，溯源链为 **答案 → wiki 页 → 来源页/页码 → 源树节点 → 原始页**。
 
 ## CLI
 
 ```bash
-tw ingest report.pdf --desc "v1.0 平台部署文档"   # 摄取一个来源（可附描述）
-tw query "Q1 收入是多少?" --doc src_0001
-tw status                      # 来源统计
-tw tree src_0001               # 打印树索引
+tw ingest report.pdf --desc "v1.0 平台部署文档"   # 摄取一个来源（可附描述，自动蒸馏 wiki）
+tw distill src_0001                            # 对已有来源重跑 wiki 蒸馏
+tw wiki                                        # 列出 wiki 页；tw wiki ent_acme 查看单页
+tw query "Q1 收入是多少?" --doc src_0001        # 默认 cascade
+tw query "跨文档对比 A/B" --mode wiki           # wiki / raw / parallel
+tw status                                      # 来源与 wiki 统计
+tw tree src_0001                               # 打印树索引
 ```
 
 ## 实体对齐（别名索引）

@@ -129,7 +129,7 @@
             <tr><td>构建节奏</td><td>每篇文档一次，随源文档不可变</td><td>持续增量维护，每加来源/问题都在变富</td></tr>
             <tr><td>检索方式</td><td>LLM 自顶向下推理遍历树</td><td>index.md + [[互链]] + grep（M3）</td></tr>
             <tr><td>溯源精度</td><td>页级：答案 → 节点 → 页码</td><td>claim 级：知识页 → doc:pages → 源树</td></tr>
-            <tr><td>当前状态</td><td><span class="status-chip ok">M1 已运行</span></td><td><span class="status-chip pending">M2 规划中</span></td></tr>
+            <tr><td>当前状态</td><td><span class="status-chip ok">M1 已运行</span></td><td><span class="status-chip ok">M2 已接入</span></td></tr>
           </tbody>
         </table>
       </div>
@@ -209,7 +209,7 @@
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>doc_id</th><th>文件</th><th>页数</th><th>节点</th><th>摄取时间</th><th>状态</th></tr></thead>
+          <thead><tr><th>doc_id</th><th>文件</th><th>页数</th><th>节点</th><th>摄取时间</th><th>状态</th><th>Wiki</th></tr></thead>
           <tbody id="sources_table"></tbody>
         </table>
       </div>
@@ -249,11 +249,11 @@
     <div id="wiki_empty">
       <div class="empty-explainer card">
         <div class="empty-explainer-head">
-          <span class="status-chip pending">M2 待接入</span>
+          <span class="status-chip pending">M2 已接入 · 等待产物</span>
           <h2>当前知识库还没有 LLMWiki 产物</h2>
           <p>
-            M1 只运行 PageIndex 通路，所以 <code>kb/wiki/</code> 目前为空。
-            下面是 LLMWiki 会产出的内容与真实落盘位置；当 M2 生成文件后，本页会自动切换为可浏览视图。
+            M2 会在摄取完成后自动蒸馏 wiki，也可以在「总览」的来源表里点「蒸馏」重跑。
+            生成后会落盘到 <code>kb/wiki/</code>，本页自动切换为可浏览视图。
           </p>
         </div>
       </div>
@@ -343,25 +343,30 @@ stale: false
           <span class="eyebrow">TREE RETRIEVAL</span>
           <h3>基于源树推理遍历</h3>
         </div>
-        <span class="status-chip ok">raw · PageIndex 通路</span>
+        <span class="status-chip ok">cascade / wiki / raw / parallel</span>
       </div>
       <div class="query-grid">
         <label>文档
           <select id="query_doc"></select>
         </label>
         <label>模式
-          <input type="text" value="raw（树定位 → 读页 → 引用作答）" disabled>
+          <select id="query_mode">
+            <option value="cascade">cascade · Wiki 优先，不足下钻源树（默认）</option>
+            <option value="wiki">wiki · 只读 LLMWiki 知识页</option>
+            <option value="raw">raw · 树定位 → 读页 → 引用作答</option>
+            <option value="parallel">parallel · 双路检索 + 一致性对比</option>
+          </select>
         </label>
       </div>
       <label class="question-label">问题
         <input type="text" id="query_text" placeholder="例如：Q1 的总收入是多少？">
       </label>
       <div class="query-actions">
-        <button class="btn" id="btn_query">开始树遍历</button>
+        <button class="btn" id="btn_query">开始检索</button>
         <span class="muted" id="query_msg"></span>
       </div>
       <p class="hint">
-        当前只实现 raw 模式。Wiki / cascade / parallel 属于 M2/M3：前者要先有 LLMWiki 产物，后者需要两路检索与对比汇总。
+        cascade 先命中 Wiki 页，页面不足或问题需要原文细节时沿引用下钻源树；parallel 同时跑两路并做一致性核验；raw 必须选择具体文档，其余模式可选「全部文档」自动定位。
       </p>
     </div>
 

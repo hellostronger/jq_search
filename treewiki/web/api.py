@@ -21,7 +21,7 @@ from ..core.store import KB
 from ..core.tree import iter_nodes, skeleton_text
 from ..pipelines.entities import build_entities
 from ..pipelines.ingest import ingest_file
-from ..pipelines.query import query_raw
+from ..pipelines.query import run_query
 
 app = FastAPI(title="TreeWiki")
 STATIC_DIR = Path(__file__).parent / "static"
@@ -73,14 +73,15 @@ class ConfigPayload(BaseModel):
     llm: dict | None = None
     mineru: dict | None = None
     index: dict | None = None
+    wiki: dict | None = None
     query: dict | None = None
     entities: dict | None = None
 
 
 class QueryPayload(BaseModel):
-    doc_id: str
+    doc_id: str | None = None
     question: str
-    mode: str = "raw"
+    mode: str | None = None
 
 
 # ------------------------------------------------------------------- 配置
@@ -95,7 +96,7 @@ def get_config():
 def put_config(payload: ConfigPayload):
     home = kb_home()
     cfg = load_config(home)
-    for section in ("llm", "mineru", "index", "query", "entities"):
+    for section in ("llm", "mineru", "index", "wiki", "query", "entities"):
         incoming = getattr(payload, section)
         if isinstance(incoming, dict):
             cfg.setdefault(section, {}).update(
@@ -166,6 +167,37 @@ def get_job(job_id: str):
     if not job:
         raise HTTPException(404, "任务不存在")
     return job
+
+
+# ------------------------------------------------------------------- wiki 层
+
+@app.post("/api/distill/{doc_id}")
+def distill(doc_id: str):
+    home = kb_home()
+    kb = KB(home)
+    if doc_id not in kb.sources():
+        raise HTTPException(404, f"未知文档: {doc_id}")
+    job_id = uuid.uuid4().hex[:12]
+    JOBS[job_id] = {"status": "running", "stages": [], "doc_id": doc_id, "stats": None, "error": None}
+
+    def run() -> None:
+        try:
+            from ..pipelines.distill import distill_source
+
+            cfg = load_config(home)
+            stats = distill_source(
+                doc_id,
+                KB(home),
+                LLM(cfg),
+                cfg,
+                stage=lambda s: JOBS[job_id]["stages"].append(s),
+            )
+            JOBS[job_id].update(status="done", stats=stats)
+        except Exception as e:  # noqa: BLE001
+            JOBS[job_id].update(status="error", error=str(e))
+
+    threading.Thread(target=run, daemon=True).start()
+    return {"job_id": job_id}
 
 
 # ------------------------------------------------------------------- 查询
@@ -368,19 +400,25 @@ def get_wiki_page(path: str):
 
 
 @app.post("/api/query")
-def run_query(payload: QueryPayload):
-    if payload.mode != "raw":
-        raise HTTPException(400, "v1 仅支持 raw 模式（wiki/cascade/parallel 见设计文档 M2/M3）")
+def api_query(payload: QueryPayload):
     cfg = load_config(kb_home())
     try:
         llm = LLM(cfg)
     except Exception as e:
         raise HTTPException(400, f"LLM 配置无效: {e}")
     try:
-        result = query_raw(payload.doc_id, payload.question, _kb(), llm, cfg)
+        return run_query(
+            payload.question,
+            _kb(),
+            llm,
+            cfg,
+            mode=payload.mode,
+            doc_id=payload.doc_id or None,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
-    return result
 
 
 @app.get("/api/skeleton/{doc_id}")

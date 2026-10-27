@@ -188,6 +188,14 @@ citations:                  # 溯源链中段：claim 级
   - doc: src_0007
     pages: [1, 2]
     claim: "FY25 Q1 收入 $24.7B，同比 +5%"
+relations:                  # 类型化关系（target 为 wiki 页 id）
+  - predicate: 拥有
+    target: ent_disney_plus
+    doc: src_0007
+    pages: [3]
+key_points:                 # 来源页/概览页的要点
+  - "流媒体业务首次实现季度盈利"
+links: [ent_disney_plus, top_流媒体]   # 非关系型关联
 updated: 2026-10-19
 stale: false
 ---
@@ -395,9 +403,9 @@ tw serve                         # 启动本地 Web UI（设置页：LLM/解析/
 
 | 里程碑 | 内容 | 验证标准 |
 |---|---|---|
-| **M1** 检索内核 | MinerU 解析 → 建树（flash+classic）→ 树遍历问答，页级引用；含 `tw serve` 配置页 | 用 PageIndex 仓库示例 PDF 复刻其问答效果 |
-| **M2** wiki 层 | 蒸馏、页面格式、[[互链]]、index.md/log.md、来源摘要页 | ingest 一个来源，wiki 页正确生成且老页面被更新 |
-| **M3** 融合查询 | wiki 树构建 + 三模式查询 agent（cascade / solo / parallel，答案回填） | 同一问题 wiki 路径显著省 token；跨文档综合题可答；parallel 模式能检出 wiki 陈旧 |
+| **M1** 检索内核 | MinerU 解析 → 建树（flash+classic）→ 树遍历问答，页级引用；含 `tw serve` 配置页 | ✅ 已实现：用真实 PDF 复刻页级引用问答 |
+| **M2** wiki 层 | 蒸馏、页面格式、[[互链]]、index.md/log.md、来源摘要页 | ✅ 已实现：ingest 自动蒸馏；实体/主题/关系/来源页 + wiki 树；重复蒸馏幂等合并 |
+| **M3** 融合查询 | wiki 树构建 + 三模式查询 agent（cascade / solo / parallel，答案回填） | 🚧 查询部分已实现：cascade / wiki / raw / parallel + 双路对比；答案回填 analyses 待做 |
 | **M4** 维护 | update（树 diff + surgical 更新）、lint | 来源换新版后仅相关 wiki 页变化 |
 | **M5** 评测打磨 | 小型 QA 评测（vs BM25 基线）、CLI/文档 | 评测报告 + README |
 

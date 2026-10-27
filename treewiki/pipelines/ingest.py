@@ -107,6 +107,20 @@ def ingest_file(
     )
     kb.save_tree(tree)
     kb.register(doc_id, dest, sha, len(pages), description=description)
+
+    if cfg.get("wiki", {}).get("enabled", True):
+        stage(f"[{doc_id}] 蒸馏 wiki（实体/主题/关系）…")
+        try:
+            from .distill import distill_source
+
+            stats = distill_source(doc_id, kb, llm, cfg, stage=stage)
+            stage(
+                f"[{doc_id}] wiki 完成：实体 {stats['entities']} / 主题 {stats['topics']} / "
+                f"关系 {stats['relations']} / 总页数 {stats['pages']}"
+            )
+        except Exception as e:  # noqa: BLE001
+            stage(f"[{doc_id}] wiki 蒸馏失败（可重跑 tw distill {doc_id}）：{e}")
+
     stage(f"[{doc_id}] 完成：{len(pages)} 页，{tree_stats(tree)}")
     return doc_id
 

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .entities import EntityIndex
 from .tree import TreeDoc
 
 
@@ -97,6 +98,21 @@ class KB:
         if not p.is_file():
             raise FileNotFoundError(f"未找到 {doc_id} 的树索引")
         return TreeDoc.model_validate_json(p.read_text(encoding="utf-8"))
+
+    @property
+    def entities_path(self) -> Path:
+        return self.home / "index" / "entities.json"
+
+    def save_entities(self, index: EntityIndex) -> None:
+        self.entities_path.parent.mkdir(parents=True, exist_ok=True)
+        self.entities_path.write_text(index.model_dump_json(indent=1), encoding="utf-8")
+
+    def load_entities(self) -> EntityIndex:
+        if not self.entities_path.is_file():
+            return EntityIndex(docs=sorted(self.sources()))
+        return EntityIndex.model_validate_json(
+            self.entities_path.read_text(encoding="utf-8")
+        )
 
 
 def sha256_file(path: Path) -> str:

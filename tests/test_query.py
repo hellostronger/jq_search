@@ -3,6 +3,7 @@ import json
 import pytest
 
 from treewiki.config import DEFAULTS
+from treewiki.core.entities import Entity, EntityIndex
 from treewiki.core.store import KB
 from treewiki.core.tree import Node, TreeDoc, assign_ids, flash_skeleton
 from treewiki.pipelines.query import (
@@ -12,6 +13,8 @@ from treewiki.pipelines.query import (
     _window,
     anchor_terms,
     query_raw,
+    question_anchors,
+    resolve_followup,
 )
 
 
@@ -106,6 +109,31 @@ def test_query_raw_flow(kb):
     assert result["fallback"] == "none"
     assert len(result["rounds"]) == 1
     assert result["rounds"][0]["read"] == ["0002"]
+
+
+def test_query_raw_followup_resolves_subject_and_passes_history(kb):
+    llm = FakeLLM(
+        [
+            {"read": ["0001"], "expand": [], "reason": "收入问题"},
+            _answer([1], "收入 100 亿 [p1]"),
+        ]
+    )
+    history = [
+        {"role": "user", "content": "赛力斯汽车2026年营业收入是多少？"},
+        {"role": "assistant", "content": "100 亿元 [p1]"},
+    ]
+    result = query_raw("src_0001", "那收入是多少？", kb, llm, _cfg(), history=history)
+    assert result["resolved_question"] == "赛力斯汽车收入是多少？"
+    prompt = _last_user(llm)
+    assert "前几轮对话" in prompt
+    assert "问题：赛力斯汽车收入是多少？" in prompt
+
+
+def test_resolve_followup_only_rewrites_elliptic_questions():
+    history = [{"role": "user", "content": "Anthropic在2025年的总营收约为多少？"}]
+    assert resolve_followup("那三季度实现营收多少？", history) == "Anthropic三季度实现营收多少？"
+    assert resolve_followup("英伟达的毛利率是多少？", history) == "英伟达的毛利率是多少？"
+    assert resolve_followup("那三季度实现营收多少？", []) == "那三季度实现营收多少？"
 
 
 def test_query_raw_expand_leaf_reads_it(kb):
@@ -410,6 +438,111 @@ def test_window_keeps_anchor_term_visible_in_long_summary():
     assert _window("短摘要", ["duo"], 200) == "短摘要"
 
 
+def _entity_index() -> EntityIndex:
+    canonical = "宁德时代"
+    alias = "宁德时代新能源科技股份有限公司"
+    return EntityIndex(
+        docs=["src_0001"],
+        entities=[
+            Entity(
+                id="ent_0001",
+                canonical=canonical,
+                type="ORG",
+                aliases=[alias],
+                frequency=6,
+            )
+        ],
+        alias_index={"宁德时代": "ent_0001", alias: "ent_0001"},
+    )
+
+
+def test_question_anchors_replaces_long_cjk_run_with_known_entity():
+    question = "宁德时代新能源科技股份有限公司的收入如何？"
+    assert anchor_terms(question) == ["宁德时代新能源科技股份有限公司的收入如何"]
+    assert question_anchors(question, _entity_index()) == [
+        "宁德时代新能源科技股份有限公司"
+    ]
+
+
+def test_question_anchors_without_index_is_unchanged():
+    question = "iPhone Duo 发行价格多少？"
+    assert question_anchors(question, None) == anchor_terms(question)
+
+
+def _generic_index() -> EntityIndex:
+    return EntityIndex(
+        docs=["src_0001"],
+        entities=[
+            Entity(
+                id="ent_0001",
+                canonical="分别为",
+                type="OTHER",
+                frequency=12,
+                sources=["ngram"],
+            )
+        ],
+        alias_index={"分别为": "ent_0001"},
+    )
+
+
+def test_question_anchors_skips_generic_entity_and_keeps_base_terms():
+    question = "三季度营收分别为多少？"
+    base = anchor_terms(question)
+    assert question_anchors(question, _generic_index()) == base
+
+
+def test_question_anchors_keeps_only_longest_nested_latin_name():
+    index = EntityIndex(
+        docs=["src_0001"],
+        entities=[
+            Entity(id="ent_0001", canonical="iPad", type="PRODUCT", frequency=6),
+            Entity(id="ent_0002", canonical="Pad", type="OTHER", frequency=3),
+            Entity(id="ent_0003", canonical="AD", type="OTHER", frequency=3),
+            Entity(id="ent_0004", canonical="IP", type="OTHER", frequency=3),
+        ],
+        alias_index={"ipad": "ent_0001", "pad": "ent_0002", "ad": "ent_0003", "ip": "ent_0004"},
+    )
+    assert question_anchors("如何将视频传入ipad？", index) == ["iPad"]
+
+
+def test_question_anchors_skips_interrogatives_even_as_alias():
+    index = EntityIndex(
+        docs=["src_0001"],
+        entities=[
+            Entity(
+                id="ent_0001",
+                canonical="一般",
+                type="OTHER",
+                aliases=["什么"],
+                frequency=6,
+            )
+        ],
+        alias_index={"一般": "ent_0001", "什么": "ent_0001"},
+    )
+    question = "什么是桥？"
+    assert question_anchors(question, index) == anchor_terms(question)
+
+
+def test_anchor_groups_does_not_expand_to_a_generic_alias():
+    from treewiki.pipelines.query import anchor_groups
+
+    index = EntityIndex(
+        docs=["src_0001"],
+        entities=[
+            Entity(
+                id="ent_0001",
+                canonical="宁德时代",
+                type="ORG",
+                aliases=["增长"],
+                frequency=6,
+                sources=["suffix"],
+            )
+        ],
+        alias_index={"宁德时代": "ent_0001", "增长": "ent_0001"},
+    )
+    assert anchor_groups(["宁德时代"], index, 6) == [["宁德时代"]]
+
+
 def _duo_kb(tmp_path):
     filler = "本节为当日资讯汇总，覆盖市场、公司与产业动态。"
     duo_text = filler * 12 + "苹果首款折叠屏 iPhone Duo 于 10 月 16 日开启预购，售价 15999 元起。"
@@ -427,6 +560,47 @@ def _duo_kb(tmp_path):
             for i in range(1, 7)
         ],
     )
+
+
+def test_query_raw_alias_expansion_rescues_short_form_page(tmp_path):
+    """问题用全称、原文只用简称时，别名组仍要命中简称页。"""
+    pages = [
+        "# 行业综述\n\n与宁德时代签署供货协议。",
+        "# 公司公告\n\n宁德时代新能源科技股份有限公司披露业绩。",
+        "# 其他\n\n无关内容。",
+    ]
+    kb, doc_id = _make_kb(tmp_path, pages)
+    kb.save_entities(_entity_index())
+    llm = FakeLLM(
+        [
+            {"read": ["0002"], "expand": [], "reason": "公告页"},
+            _answer([2], "披露业绩 [p2]"),
+        ]
+    )
+    result = query_raw(
+        doc_id, "宁德时代新能源科技股份有限公司的收入如何？", kb, llm, _cfg()
+    )
+    assert result["lexical"]["terms"] == ["宁德时代新能源科技股份有限公司"]
+    assert result["lexical"]["groups"][0] == [
+        "宁德时代新能源科技股份有限公司",
+        "宁德时代",
+    ]
+    assert result["lexical"]["pages"] == [1, 2]
+    assert 1 in result["read_pages"]
+
+
+def test_query_raw_without_entity_index_keeps_legacy_behavior(tmp_path):
+    pages = [
+        "# 行业综述\n\n与宁德时代签署供货协议。",
+        "# 公司公告\n\n宁德时代新能源科技股份有限公司披露业绩。",
+        "# 其他\n\n无关内容。",
+    ]
+    kb, doc_id = _make_kb(tmp_path, pages)
+    llm = FakeLLM([{"read": ["0002"], "expand": [], "reason": "公告页"}, _answer([2])])
+    result = query_raw(
+        doc_id, "宁德时代新能源科技股份有限公司的收入如何？", kb, llm, _cfg()
+    )
+    assert result["lexical"]["pages"] == []
 
 
 def test_query_raw_lexical_hit_rescues_wrong_branch(tmp_path):

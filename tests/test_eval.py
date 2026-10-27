@@ -1,8 +1,13 @@
 import random
+from pathlib import Path
 
+from treewiki.core.entities import Entity, EntityIndex, normalize
+from treewiki.core.store import KB
 from treewiki.eval.dataset import (
     Article,
     _cloze,
+    derive_multihop,
+    derive_multiturn,
     _figures,
     _left_context,
     _longest_run,
@@ -10,6 +15,7 @@ from treewiki.eval.dataset import (
     _MONEY,
     _PCT,
     _paraphrase,
+    _subjectless,
     _underspecified,
     classify_by_lexicon,
     build_factual_items,
@@ -19,7 +25,16 @@ from treewiki.eval.dataset import (
     quota,
     split_articles,
 )
-from treewiki.eval.runner import _ngram_terms, _pages_with, cited_pages, grade
+from treewiki.eval.runner import (
+    _ngram_terms,
+    _pages_with,
+    cited_pages,
+    entity_probe,
+    grade,
+    grade_multiturn,
+)
+from treewiki.eval.replay import build_replay_kb, reconstruct
+from treewiki.pipelines.query import resolve_followup
 
 P1 = (
     "**【文章 A0001】苹果上调 iPhone 17 备货**\n\n"
@@ -66,10 +81,37 @@ def test_cloze_rejects_deictic_clause_that_cannot_stand_alone():
     assert _cloze(sent, m, "money", art) is None
 
 
-def test_paraphrase_drops_latin_entity_and_stays_answerable():
+def test_paraphrase_keeps_latin_entity_when_stripping_would_lose_the_subject():
     q = "iPhone 17 的同比增长是多少？"
     out = _paraphrase(q)
-    assert out and "iPhone" not in out and "去年同期" in out
+    assert out and "iPhone" in out and "去年同期" in out
+
+
+def test_subjectless_question_is_rejected_even_if_clause_reads_smoothly():
+    for q in (
+        "9月环比走高多少？",
+        "最新市值升至多少？",
+        "第三季度营业收入为多少？",
+        "2027年3月升至多少？",
+        "各治疗组中超过多少？",
+        "较去年同期增长多少？",
+    ):
+        assert _subjectless(q), q
+    for q in (
+        "赛力斯汽车9月批发销量为多少？",
+        "富祥股份市值多少？",
+        "台积电预计2026年营收增长多少？",
+        "三星电子第三季度营收同比增长多少？",
+    ):
+        assert not _subjectless(q), q
+
+
+def test_cloze_drops_sentence_whose_subject_only_lives_in_the_article():
+    art = Article(aid="A0001", title="月度数据")
+    sent = "9月环比走高 1.2 个百分点。"
+    m = _PCT.search(sent)
+    assert m
+    assert _cloze(sent, m, "pct", art) is None
 
 
 def test_tier_uses_production_anchor_behaviour_not_template_guess():
@@ -485,3 +527,235 @@ def test_factual_items_take_three_sentences_per_article():
     items = build_factual_items([art], random.Random(7))
     literal = [i for i in items if i["kind"] == "literal"]
     assert len(literal) == 3
+
+
+def test_replay_reconstructs_literal_and_borrows_literal_for_para():
+    items = [
+        {
+            "id": "1", "tier": "A", "kind": "literal", "article": "A0001",
+            "question": "测试公司营收为多少？", "gold_match": "100亿元",
+            "gold_figures": ["100"], "gold_pages": [2], "gold_span": [2, 2],
+        },
+        {
+            "id": "2", "tier": "S", "kind": "para", "article": "A0001",
+            "question": "测试公司收入体量为多少？", "gold_match": "100亿元",
+            "gold_figures": ["100"], "gold_pages": [2], "gold_span": [2, 2],
+        },
+        {
+            "id": "3", "tier": "C", "kind": "timeline",
+            "question": "测试公司 最近的报道里有哪些数字？",
+            "gold_pages": [5], "gold_span": [5, 6],
+        },
+    ]
+    corpus = reconstruct(items)
+    assert corpus.total == 6
+    assert corpus.pages[2] == ["测试公司营收为100亿元。"]
+    assert corpus.pages.get(5, []) == []
+    assert corpus.stats["by_tier"] == {"A": 1, "S": 1}
+
+
+def test_build_replay_kb_preserves_original_page_numbers(tmp_path):
+    rows = [
+        {
+            "id": "1", "tier": "A", "kind": "literal", "article": "A0001",
+            "question": "测试公司营收为多少？", "gold_match": "100亿元",
+            "gold_figures": ["100"], "gold_pages": [2], "gold_span": [2, 3],
+        }
+    ]
+    dataset = tmp_path / "dataset.jsonl"
+    dataset.write_text(
+        "\n".join(__import__("json").dumps(r, ensure_ascii=False) for r in rows),
+        encoding="utf-8",
+    )
+    kb, corpus = build_replay_kb(dataset, tmp_path / "kb")
+    assert kb.page_count("src_0001") == 3
+    assert kb.read_pages("src_0001", 2, 2) == ["测试公司营收为100亿元。"]
+    assert kb.read_pages("src_0001", 1, 1) == [""]
+
+
+def _probe_index() -> EntityIndex:
+    full = "宁德时代新能源科技股份有限公司"
+    short = "宁德时代"
+    return EntityIndex(
+        docs=["src_0001"],
+        entities=[
+            Entity(
+                id="ent_0001",
+                canonical=full,
+                type="ORG",
+                aliases=[short],
+                frequency=6,
+                sources=["suffix"],
+            )
+        ],
+        alias_index={normalize(full): "ent_0001", normalize(short): "ent_0001"},
+    )
+
+
+def test_entity_probe_separates_alias_gain_from_short_anchor_gain(tmp_path):
+    kb = KB(tmp_path / "kb")
+    kb.write_pages(
+        "src_0001",
+        ["无关内容。", "宁德时代营收为100亿元。", "宁德时代新能源科技股份有限公司披露业绩。"],
+    )
+    kb.register("src_0001", Path("dataset.jsonl"), "-", 3)
+    kb.save_entities(_probe_index())
+    items = [
+        {
+            "id": "short-page", "tier": "S", "kind": "literal",
+            "question": "宁德时代新能源科技股份有限公司营收为多少？",
+            "gold_pages": [2], "gold_figures": ["100"],
+        },
+        {
+            "id": "full-page", "tier": "S", "kind": "literal",
+            "question": "宁德时代新能源科技股份有限公司营收为多少？",
+            "gold_pages": [3], "gold_figures": ["100"],
+        },
+    ]
+    rows = {r["id"]: r for r in entity_probe(kb, "src_0001", items, 12)}
+    assert rows["short-page"]["old_hit"] is False
+    assert rows["short-page"]["alias_gain"] is True
+    assert rows["short-page"]["anchor_gain"] is False
+    assert rows["full-page"]["old_hit"] is False
+    assert rows["full-page"]["anchor_gain"] is True
+
+
+def _hop_sources():
+    return [
+        {
+            "id": "h1", "tier": "A", "kind": "literal", "article": "A1",
+            "question": "赛力斯汽车9月批发销量为多少？",
+            "gold_pages": [1], "gold_span": [1, 1], "gold_figures": ["1.2"],
+        },
+        {
+            "id": "h2", "tier": "S", "kind": "literal", "article": "A1",
+            "question": "赛力斯汽车9月零售销量是多少？",
+            "gold_pages": [2], "gold_span": [2, 2], "gold_figures": ["2.4"],
+        },
+    ]
+
+
+def test_derive_multihop_combines_two_facts_and_keeps_hop_metadata():
+    items = derive_multihop(_hop_sources())
+    assert len(items) == 1
+    it = items[0]
+    assert it["tier"] == "H" and it["kind"] == "multihop"
+    assert "批发销量" in it["question"] and "零售销量" in it["question"]
+    assert it["question"].endswith("分别是多少？")
+    assert it["gold_pages"] == [1, 2]
+    assert [h["figures"] for h in it["hops"]] == [["1.2"], ["2.4"]]
+
+
+def test_derive_multihop_preserves_motion_predicate():
+    src = [
+        {**_hop_sources()[0], "question": "重要堤防达标率升至多少？", "gold_pages": [1]},
+        {**_hop_sources()[1], "question": "国家水网覆盖率升至多少？", "gold_pages": [2]},
+    ]
+    it = derive_multihop(src)[0]
+    assert it["question"].endswith("分别升至多少？")
+    assert "分别是多少" not in it["question"]
+
+
+def test_derive_multihop_rejects_change_question_pairs():
+    # “股价下跌多少” + “股价上涨多少” 不能合并成 “股价分别是多少”，那是两个不同的量
+    src = [
+        {**_hop_sources()[0], "question": "德州仪器股价下跌多少？", "gold_pages": [1]},
+        {**_hop_sources()[1], "question": "美光科技股价上涨多少？", "gold_pages": [2]},
+    ]
+    assert derive_multihop(src) == []
+
+
+def test_derive_multihop_rejects_fragment_left_and_same_figure():
+    bad = [
+        {**_hop_sources()[0], "id": "f1", "question": "ROIC连续两年回多少？"},
+        {**_hop_sources()[1], "id": "f2"},
+    ]
+    assert derive_multihop(bad) == []
+    same = [
+        {**_hop_sources()[0], "id": "s1"},
+        {**_hop_sources()[1], "id": "s2", "gold_figures": ["1.20"]},
+    ]
+    assert derive_multihop(same) == []
+
+
+def test_derive_multihop_marks_other_pages_restating_both_facts():
+    src = [
+        {**_hop_sources()[0], "gold_pages": [1]},
+        {**_hop_sources()[1], "gold_pages": [2]},
+    ]
+    # lows 是 0 基：第 1 页 = lows[0]
+    lows = [
+        "赛力斯汽车9月批发销量 1.2 万辆",
+        "赛力斯汽车9月零售销量 2.4 万辆",
+        "行情：赛力斯汽车9月批发销量 1.2 万辆，零售销量 2.4 万辆",
+    ]
+    it = derive_multihop(src, lows=lows)[0]
+    # 第 3 页复述了两处事实，也要标成 gold；判分不能只认来源页
+    assert it["gold_pages"] == [1, 2, 3]
+
+
+def test_grade_multihop_accepts_another_page_with_same_figures():
+    it = derive_multihop(_hop_sources())[0]
+    lows = [
+        "赛力斯汽车9月批发销量 1.2 万辆",
+        "赛力斯汽车9月零售销量 2.4 万辆",
+        "行情：批发销量 1.2 万辆，零售销量 2.4 万辆",
+    ]
+    alt = {
+        "answer": "批发 1.2 万辆，零售 2.4 万辆 [p3]",
+        "citations": [{"pages": [3]}],
+        "read_pages": [3],
+    }
+    row = grade(it, alt, lows)
+    assert row["ok"] and row["hop_ok"] == [True, True]
+    assert row["page_hit"] is False
+
+
+def test_grade_multihop_needs_both_hops():
+    it = derive_multihop(_hop_sources())[0]
+    lows = ["", "赛力斯汽车9月批发销量 1.2 万辆", "赛力斯汽车9月零售销量 2.4 万辆"]
+    both = {
+        "answer": "批发 1.2 万辆，零售 2.4 万辆 [p1][p2]",
+        "citations": [{"pages": [1, 2]}],
+        "read_pages": [1, 2],
+    }
+    row = grade(it, both, lows)
+    assert row["ok"] and row["hop_ok"] == [True, True]
+    one = {"answer": "批发 1.2 万辆 [p1]", "citations": [{"pages": [1]}], "read_pages": [1]}
+    row = grade(it, one, lows)
+    assert not row["ok"] and row["hop_ok"] == [True, False]
+
+
+def test_derive_multiturn_elides_subject_and_grade_needs_each_turn():
+    items = derive_multiturn(_hop_sources())
+    assert len(items) == 1
+    it = items[0]
+    q1, q2 = it["turns"][0]["question"], it["turns"][1]["question"]
+    assert q2.startswith("那") and "赛力斯汽车" not in q2
+    history = [{"role": "user", "content": q1}]
+    assert resolve_followup(q2, history) == "赛力斯汽车9月零售销量是多少？"
+    lows = ["赛力斯汽车9月批发销量 1.2 万辆", "赛力斯汽车9月零售销量 2.4 万辆"]
+    results = [
+        {"answer": "批发 1.2 万辆 [p1]", "citations": [{"pages": [1]}], "read_pages": [1],
+         "resolved_question": q1},
+        {"answer": "零售 2.4 万辆 [p2]", "citations": [{"pages": [2]}], "read_pages": [2],
+         "resolved_question": "赛力斯汽车9月零售销量是多少？"},
+    ]
+    row = grade_multiturn(it, results, lows)
+    assert row["ok"] and row["turn_ok"] == [True, True]
+    row = grade_multiturn(it, [results[0], {**results[1], "answer": "不确定"}], lows)
+    assert not row["ok"] and row["turn_ok"] == [True, False]
+
+
+def test_derive_multiturn_skips_multi_value_followup():
+    src = [
+        {
+            "id": "m1", "tier": "A", "kind": "literal", "article": "A1",
+            "question": "皇冠新材的发行价为多少？", "gold_pages": [1], "gold_figures": ["16.98"],
+        },
+        {
+            "id": "m2", "tier": "S", "kind": "literal", "article": "A1",
+            "question": "皇冠新材的营业收入分别为多少？", "gold_pages": [2], "gold_figures": ["28.95"],
+        },
+    ]
+    assert derive_multiturn(src) == []

@@ -36,6 +36,19 @@ DEFAULTS: dict[str, Any] = {
         "summary_chars": 6000,
         "lexical_pages": 12,
     },
+    "entities": {
+        "enabled": True,
+        "min_frequency": 2,
+        "similarity_threshold": 0.5,
+        "context_window": 60,
+        "max_block_size": 200,
+        "extract_ngrams": True,
+        "ngram_max": 6,
+        "ngram_min_frequency": 3,
+        "ngram_min_entropy": 0.5,
+        "query_expansion": True,
+        "expand_limit": 6,
+    },
 }
 
 

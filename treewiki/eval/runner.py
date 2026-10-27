@@ -19,9 +19,11 @@ from ..pipelines.query import (
     _lexical_pages,
     _nodes_for_pages,
     _pages_of,
+    anchor_groups,
     anchor_terms,
     iter_nodes,
     query_raw,
+    question_anchors,
 )
 from .dataset import read_jsonl, write_jsonl
 
@@ -68,7 +70,30 @@ def grade(item: dict, result: dict, lows: list[str] | None = None) -> dict:
     )
     figure_ok = bool(hit_all) or not figures
     grounded = page_hit or article_hit or verifiable
-    if tier == "D":
+    hops = item.get("hops") or []
+    hop_ok: list[bool] = []
+    if tier == "H":
+        if hops:
+            for hop in hops:
+                ps = {int(p) for p in hop.get("pages") or []}
+                fs = hop.get("figures") or []
+                f_ok = not fs or any(_norm(f) in answer for f in fs)
+                # 标准答案可能不止来源页：别的页原文里也写着这个数字，同样算引用得住
+                p_ok = bool(ps & got) or (
+                    bool(lows)
+                    and bool(fs)
+                    and any(
+                        all(_norm(f) in _norm(lows[p - 1]) for f in fs)
+                        for p in got
+                        if 0 < p <= len(lows)
+                    )
+                )
+                hop_ok.append(f_ok and p_ok)
+            ok = all(hop_ok) and not refused
+        else:
+            hop_ok = [figure_ok and grounded and not refused]
+            ok = figure_ok and recall >= 0.5 and not refused
+    elif tier == "D":
         ok = refused
     elif tier == "C":
         ok = coverage >= 0.5
@@ -79,6 +104,8 @@ def grade(item: dict, result: dict, lows: list[str] | None = None) -> dict:
         "tier": tier,
         "question": item["question"],
         "ok": ok,
+        "hop_ok": hop_ok,
+        "hop_total": len(hop_ok),
         "page_hit": page_hit,
         "near_page_hit": near_hit,
         "article_hit": article_hit,
@@ -96,10 +123,65 @@ def grade(item: dict, result: dict, lows: list[str] | None = None) -> dict:
         "rounds": len(result.get("rounds") or []),
         "usage": result.get("usage") or {},
         "answer_head": (result.get("answer") or "")[:240],
+        "resolved_question": result.get("resolved_question"),
         "answer_status": result.get("answer_status"),
         "lexical": result.get("lexical"),
         "fallback": result.get("fallback"),
     }
+
+
+def grade_multiturn(item: dict, results: list[dict], lows: list[str] | None = None) -> dict:
+    """多轮题逐轮判分：每一轮都要有数字、有撑得住的引用，全部答对才算整题通过。"""
+    rows = []
+    for n, (turn, result) in enumerate(zip(item.get("turns") or [], results), start=1):
+        sub = {
+            **item,
+            "id": f"{item['id']}#{n}",
+            "tier": "M",
+            "question": turn.get("question") or item["question"],
+            "gold_pages": turn.get("gold_pages") or [],
+            "gold_span": turn.get("gold_span") or [],
+            "gold_spans": turn.get("gold_spans") or [],
+            "gold_figures": turn.get("gold_figures") or [],
+        }
+        rows.append(grade(sub, result, lows))
+    if not rows:
+        return {**grade(item, {"answer": "", "citations": []}, lows), "turn_ok": []}
+    usage: dict = {}
+    for r in rows:
+        for k, v in (r.get("usage") or {}).items():
+            if isinstance(v, (int, float)):
+                usage[k] = usage.get(k, 0) + v
+    base = rows[0]
+    base.update(
+        {
+            "id": item["id"],
+            "tier": "M",
+            "question": item["question"],
+            "ok": all(r["ok"] for r in rows),
+            "page_hit": any(r["page_hit"] for r in rows),
+            "gold_pages": sorted(
+                {p for t in item.get("turns") or [] for p in t.get("gold_pages") or []}
+            ),
+            "cited_pages": sorted({p for r in rows for p in r["cited_pages"]}),
+            "read_pages": sorted({p for r in rows for p in r.get("read_pages") or []}),
+            "figure_hit": sum(r["figure_hit"] for r in rows),
+            "figure_total": sum(r["figure_total"] for r in rows),
+            "rounds": sum(r["rounds"] for r in rows),
+            "usage": usage,
+            "refused": any(r["refused"] for r in rows),
+            "unsupported_citation": any(r["unsupported_citation"] for r in rows),
+            "answer_head": " || ".join(r["answer_head"][:110] for r in rows),
+            "turn_ok": [r["ok"] for r in rows],
+            "turn_count": len(rows),
+            "turn_questions": [t.get("question") for t in item.get("turns") or []],
+            "turn_answers": [r["answer_head"][:160] for r in rows],
+            "turn_resolved": [r.get("resolved_question") for r in rows],
+            "hop_ok": [],
+            "hop_total": 0,
+        }
+    )
+    return base
 
 
 _CJK_RUN = re.compile(r"[\u4e00-\u9fff]{2,}")
@@ -157,6 +239,74 @@ def retrieval_probe(kb: KB, doc_id: str, items: list[dict], cap: int, read_cap: 
                 "gold_pages": it["gold_pages"],
             }
         )
+    return out
+
+
+def entity_probe(
+    kb: KB, doc_id: str, items: list[dict], cap: int, expand_limit: int = 6
+) -> list[dict]:
+    """零 LLM：同一批题上对比「旧字面锚词」与「实体锚词 + 别名组」。
+
+    把增益拆成两段，避免把短锚词的收益误记到图聚类头上：
+      anchor_gain：实体短锚词命中了 gold，旧锚词没有
+      alias_gain ：短锚词也没命中，靠别名组里的非规范名才命中 gold
+    """
+    total = kb.page_count(doc_id)
+    lows = [t.lower() for t in kb.read_pages(doc_id, 1, total)]
+    index = kb.load_entities()
+    rows = []
+    for it in items:
+        gold = set(it.get("gold_pages") or [])
+        old_terms = anchor_terms(it["question"])
+        old_pages = _lexical_pages(lows, old_terms, cap)
+        terms = question_anchors(it["question"], index)
+        canon_pages = _lexical_pages(lows, [[t.lower()] for t in terms], cap)
+        groups = anchor_groups(terms, index, expand_limit)
+        new_pages = _lexical_pages(lows, groups, cap)
+        old_hit = bool(gold & set(old_pages))
+        canon_hit = bool(gold & set(canon_pages))
+        new_hit = bool(gold & set(new_pages))
+        rows.append(
+            {
+                "id": it["id"],
+                "tier": it["tier"],
+                "kind": it.get("kind"),
+                "gold_pages": sorted(gold),
+                "old_terms": old_terms,
+                "old_pages": old_pages,
+                "old_hit": old_hit,
+                "entity_terms": terms,
+                "groups": groups,
+                "canon_pages": canon_pages,
+                "canon_hit": canon_hit,
+                "new_pages": new_pages,
+                "new_hit": new_hit,
+                "anchor_gain": canon_hit and not old_hit,
+                "alias_gain": new_hit and not canon_hit,
+                "regress": old_hit and not new_hit,
+            }
+        )
+    return rows
+
+
+def _summarize_entity(rows: list[dict]) -> dict:
+    def block(group: list[dict]) -> dict:
+        n = len(group)
+        return {
+            "n": n,
+            "old_hit": round(sum(r["old_hit"] for r in group) / n, 3),
+            "entity_hit": round(sum(r["new_hit"] for r in group) / n, 3),
+            "anchor_gain": sum(r["anchor_gain"] for r in group),
+            "alias_gain": sum(r["alias_gain"] for r in group),
+            "regress": sum(r["regress"] for r in group),
+            "terms_changed": sum(r["old_terms"] != r["entity_terms"] for r in group),
+        }
+
+    out = {
+        tier: block([r for r in rows if r["tier"] == tier])
+        for tier in sorted({r["tier"] for r in rows})
+    }
+    out["all"] = block(rows)
     return out
 
 
@@ -285,13 +435,33 @@ def run_full(
         kb, llm, lows = deps()
         t0 = time.time()
         try:
-            result = query_raw(item.get("doc_id") or doc_id, item["question"], kb, llm, cfg)
-            row = grade(item, result, lows)
+            if item.get("turns"):
+                results: list[dict] = []
+                history: list[dict] = []
+                for turn in item["turns"]:
+                    r = query_raw(
+                        item.get("doc_id") or doc_id,
+                        turn["question"],
+                        kb,
+                        llm,
+                        cfg,
+                        history=history,
+                    )
+                    results.append(r)
+                    history.append({"role": "user", "content": turn["question"]})
+                    history.append({"role": "assistant", "content": r.get("answer") or ""})
+                row = grade_multiturn(item, results, lows)
+            else:
+                result = query_raw(item.get("doc_id") or doc_id, item["question"], kb, llm, cfg)
+                row = grade(item, result, lows)
         except Exception as e:  # 评测里一条失败不该终止整轮
             row = {
                 **grade(item, {"answer": f"异常：{e}", "citations": []}, lows),
                 "error": str(e)[:200],
             }
+            if item.get("turns"):
+                row["turn_ok"] = [False] * len(item["turns"])
+                row["turn_count"] = len(item["turns"])
         row["seconds"] = round(time.time() - t0, 1)
         return row
 
@@ -362,6 +532,24 @@ def summarize(rows: list[dict]) -> dict[str, Any]:
                 if tier == "C"
                 else None
             ),
+            "hop_ok_rate": (
+                round(
+                    sum(sum(g.get("hop_ok") or []) for g in group)
+                    / max(1, sum(g.get("hop_total") or 0 for g in group)),
+                    3,
+                )
+                if tier == "H"
+                else None
+            ),
+            "turn_ok_rate": (
+                round(
+                    sum(sum(g.get("turn_ok") or []) for g in group)
+                    / max(1, sum(len(g.get("turn_ok") or []) for g in group)),
+                    3,
+                )
+                if tier == "M"
+                else None
+            ),
             "median_rounds": statistics.median(g["rounds"] for g in group),
             "median_seconds": round(statistics.median(secs), 1) if secs else None,
             "median_calls": statistics.median(g["usage"].get("calls", 0) for g in group),
@@ -370,7 +558,7 @@ def summarize(rows: list[dict]) -> dict[str, Any]:
 
 
 def show_failures(path: Path, per_tier: int = 4) -> None:
-    for tier in ("A", "B", "S", "C", "D"):
+    for tier in ("A", "B", "S", "H", "M", "C", "D"):
         g = [r for r in map(_regrade, read_jsonl(path)) if r["tier"] == tier and not r["ok"]]
         if not g:
             continue
@@ -400,6 +588,18 @@ def _cause(row: dict) -> str:
         return "正确拒答" if row["ok"] else (
             "把邻近事实当成答案" if cited else "编造了数字"
         )
+    if row["tier"] == "H":
+        hops = row.get("hop_ok") or []
+        if row["ok"]:
+            return "两跳都答对"
+        if hops and sum(hops) == len(hops) - 1:
+            return "只答对其中一跳"
+    if row["tier"] == "M":
+        turns = row.get("turn_ok") or []
+        if row["ok"]:
+            return "每轮都答对"
+        if turns and any(turns):
+            return f"多轮里只答对 {sum(turns)}/{len(turns)} 轮"
     if row["ok"] and row["page_hit"]:
         return "命中 gold 页"
     if row["ok"]:
@@ -428,7 +628,7 @@ def main(
     mode: str,
     workers: int = 4,
     limit: int = 0,
-    tiers: str = "A,B,S,C,D",
+    tiers: str = "A,B,S,H,M,C,D",
     home: Path | None = None,
 ) -> None:
     items = read_jsonl(dataset_path)
@@ -441,7 +641,7 @@ def main(
             picked.extend([i for i in items if i["tier"] == t][:per])
         items = picked
     cfg = load_config(home)
-    doc_id = items[0].get("doc_id") or "src_0001"
+    doc_id = items[0].get("doc_id") if items else "src_0001"
     if mode == "report":
         rows = read_jsonl(out_path)
         print(json.dumps(summarize(rows), ensure_ascii=False, indent=2))
@@ -456,6 +656,25 @@ def main(
         )
         write_jsonl(out_path, rows)
         print(json.dumps(_summarize_probe(rows), ensure_ascii=False, indent=2))
+        return
+    if mode == "entity":
+        kb = KB(home or kb_home_of(home))
+        index = kb.load_entities()
+        rows = entity_probe(
+            kb,
+            doc_id,
+            items,
+            int(cfg["query"].get("lexical_pages", 12)),
+            int(cfg.get("entities", {}).get("expand_limit", 6)),
+        )
+        write_jsonl(out_path, rows)
+        print(
+            json.dumps(
+                {"index": index.summary(), "by_tier": _summarize_entity(rows)},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return
     if mode == "floor":
         kb = KB(kb_home_of(home))

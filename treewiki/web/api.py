@@ -19,6 +19,7 @@ from ..config import kb_home, load_config, save_config
 from ..core.llm import LLM
 from ..core.store import KB
 from ..core.tree import iter_nodes, skeleton_text
+from ..pipelines.entities import build_entities
 from ..pipelines.ingest import ingest_file
 from ..pipelines.query import query_raw
 
@@ -73,6 +74,7 @@ class ConfigPayload(BaseModel):
     mineru: dict | None = None
     index: dict | None = None
     query: dict | None = None
+    entities: dict | None = None
 
 
 class QueryPayload(BaseModel):
@@ -93,7 +95,7 @@ def get_config():
 def put_config(payload: ConfigPayload):
     home = kb_home()
     cfg = load_config(home)
-    for section in ("llm", "mineru", "index", "query"):
+    for section in ("llm", "mineru", "index", "query", "entities"):
         incoming = getattr(payload, section)
         if isinstance(incoming, dict):
             cfg.setdefault(section, {}).update(
@@ -388,6 +390,59 @@ def get_skeleton(doc_id: str):
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     return {"skeleton": skeleton_text(tree.structure, with_summary=False)}
+
+
+# ------------------------------------------------------------------- 实体索引
+
+@app.get("/api/entities")
+def get_entities(
+    q: str = Query("", max_length=100),
+    top: int = Query(100, ge=1, le=2000),
+):
+    """实体索引概览；q 非空时按规范名/别名过滤。"""
+    index = _kb().load_entities()
+    items = index.entities
+    if q.strip():
+        needle = q.strip().lower()
+        items = [
+            e
+            for e in items
+            if needle in e.canonical.lower()
+            or any(needle in a.lower() for a in e.aliases)
+        ]
+    items = sorted(items, key=lambda e: (-e.frequency, e.canonical))[:top]
+    return {"summary": index.summary(), "entities": [e.model_dump() for e in items]}
+
+
+@app.get("/api/entities/lookup")
+def lookup_entity(q: str = Query(..., min_length=1, max_length=100)):
+    index = _kb().load_entities()
+    entity = index.resolve(q)
+    if entity is None:
+        raise HTTPException(404, f"未收录：{q}")
+    return {"entity": entity.model_dump(), "aliases": index.expand(q)}
+
+
+@app.post("/api/entities/build")
+def build_entity_index():
+    """后台重建实体索引（纯本地图算法，无 LLM 调用）。"""
+    job_id = uuid.uuid4().hex[:12]
+    JOBS[job_id] = {"status": "running", "stages": [], "doc_id": None, "error": None}
+    home = kb_home()
+
+    def run() -> None:
+        try:
+            index = build_entities(
+                KB(home),
+                load_config(home),
+                stage=lambda s: JOBS[job_id]["stages"].append(s),
+            )
+            JOBS[job_id].update(status="done", summary=index.summary())
+        except Exception as e:  # noqa: BLE001
+            JOBS[job_id].update(status="error", error=str(e))
+
+    threading.Thread(target=run, daemon=True).start()
+    return {"job_id": job_id}
 
 
 # ------------------------------------------------------------------- 静态页

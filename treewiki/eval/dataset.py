@@ -9,6 +9,14 @@
   C 跨天聚合：同一实体在多天多篇出现，考时序梳理与多页引用
   D 未收录：语料里确实没有这个实体，考拒答而不是编造引用
       strict=实体串整本零命中；adjacent=实体串没有但锚词命中了别的产品（幻觉高危）
+
+派生档（由 A/B/S 题配对生成，gold 全部来自原题字段）：
+  H 多跳：同一篇里两个不同事实合成一问，两处证据、两个数字都答对才算过
+  M 多轮：同一主体、两个不同指标；第二轮省掉主语，靠对话历史补全
+
+题目自足性：单看问句必须能认出问的是谁/哪个指标。只留"9月环比走高"这类
+脱离原文就不知道在问什么的问法会让评测失真，生成时直接拒绝，已有脱敏集
+用 `upgrade_items` 剔除。
 """
 
 from __future__ import annotations
@@ -22,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.store import KB
-from ..pipelines.query import anchor_terms
+from ..pipelines.query import anchor_terms, question_subject
 
 MARKER = re.compile(r"\*\*【文章\s*(A\d{3,5})】(.+?)\*\*")
 _HEADER_DATE = re.compile(r"发布时间：(\d{4}-\d{2}-\d{2})")
@@ -145,7 +153,7 @@ def _clauses(sent: str) -> list[tuple[int, int, str]]:
 def _cue_before(left: str) -> str | None:
     """线索词必须紧贴数字（是 left 的结尾），否则完形提问会读成残句。"""
     head = left.rstrip()
-    for cue in sorted(_CUES, key=len, reverse=True):
+    for cue in sorted(_CUES, key=lambda w: (-len(w), w)):
         if head.endswith(cue):
             return cue
     return None
@@ -187,6 +195,8 @@ def _cloze(sent: str, m: re.Match, kind: str, art: Article) -> str | None:
             subj = art.subject()
             q = f"{subj}：{q}"
         q = re.sub(r"\s+", "", q)
+        if _subjectless(q):
+            return None
         return q if 8 <= len(q) <= 64 else None
     return None
 
@@ -197,11 +207,164 @@ def _paraphrase(q: str) -> str | None:
         out = out.replace(a, b)
     if out == q:
         return None
-    # 去掉拉丁实体，逼出问题只能靠语义而非字面命中
-    out = _LATIN.sub("", out)
-    out = re.sub(r"[：:，,]{2,}|^[：:，,]", "", out)
-    out = re.sub(r"\s+", "", out)
-    return out if 8 <= len(out) <= 64 and anchor_terms(out) else None
+    # 先尝试去掉拉丁实体，逼出语义检索；但若删完主体就没了，宁可保留实体
+    stripped = _LATIN.sub("", out)
+    stripped = re.sub(r"[：:，,]{2,}|^[：:，,]", "", stripped)
+    stripped = re.sub(r"\s+", "", stripped)
+    if 8 <= len(stripped) <= 64 and anchor_terms(stripped) and not _subjectless(stripped):
+        return stripped
+    kept = re.sub(r"[：:，,]{2,}|^[：:，,]", "", out)
+    kept = re.sub(r"\s+", "", kept)
+    if 8 <= len(kept) <= 64 and anchor_terms(kept) and not _subjectless(kept):
+        return kept
+    return None
+
+
+# ---- 题目自足性：单看问句必须能认出问的是谁/哪个指标 ----
+
+_TIME_HEAD = re.compile(
+    r"^(?:20\d{2}(?:财)?年(?:末|底|初|上半年|下半年)?"
+    r"|20\d{2}年\d{1,2}月(?:\d{1,2}日)?|\d{1,2}月(?:\d{1,2}日)?"
+    r"|上半年|下半年|前三季度|前\d+个月|第[一二三四]季度(?:末|底|初)?"
+    r"|[一二三四]季度(?:末|底|初)?|全年|本月|上月|本周|上周|当日|同期|今天|今年|去年|明年|截至|从|自)"
+)
+_TIME_TAIL = re.compile(
+    r"(?:20\d{2}年(?:\d{1,2}月)?|第[一二三四]季度(?:末|底|初)?"
+    r"|[一二三四]季度(?:末|底|初)?|上半年|下半年|前三季度|全年|本月|上月|本周|上周)$"
+)
+_MOD_HEAD = (
+    "同比", "环比", "累计", "合计", "分别", "均", "已", "共", "进一步", "继续",
+    "仍", "最新", "目前", "当前", "大约", "约", "超过", "突破", "至少", "或",
+    "将", "拟", "被", "实现", "录得", "每", "已经", "上市后",
+    "较", "相较", "相比", "对比", "零售", "批发",
+)
+_PRED_TAIL = (
+    "走高", "回落", "上涨", "下跌", "增长", "下降", "上升", "提升", "减少",
+    "增加", "收窄", "扩大", "突破", "超过", "达到", "升至", "降至", "涨至",
+    "跌至", "净流出", "净流入", "增至", "减至", "攀升至", "报", "为", "是", "至",
+)
+# 指标名词：整条问句只剩这些词时，说明主体被切掉了
+_METRIC_WORDS = (
+    "总市值", "市值", "营收", "营业收入", "收入", "净利润", "净利", "利润",
+    "规模", "体量", "价格", "售价", "定价", "金额", "价款", "净额", "总额",
+    "余额", "销量", "出货量", "发货量", "产量", "产能", "份额", "占比", "比例",
+    "涨幅", "跌幅", "增幅", "增速", "上限", "下限", "利率", "收益率", "成本",
+    "费用", "估值", "股价", "评分", "数量", "次数", "面积", "容量", "电量",
+    "密度", "效率", "良率", "转化率", "渗透率", "概率", "价值", "中位数",
+    "销售额", "净营收", "表现", "融资", "募集资金", "所得款项", "持股数量",
+    "代码", "排名", "价格区间", "发行价",
+)
+# 范围/指代/泛称：不构成主体
+_SCOPE_WORDS = (
+    "全球", "全国", "我国", "海外", "国内", "行业", "市场", "整体", "部分",
+    "多个", "各", "每", "两者", "二者", "前者", "后者", "其中", "相关", "主要",
+    "全部", "所有", "该", "本", "这", "那", "某些", "若干", "一些", "全美",
+    "公司", "企业", "集团", "银行", "机构", "部门", "产品", "业务", "项目",
+    "平台", "系统", "设备", "车型", "主体", "客户", "用户", "投资者", "股东",
+    "消费者", "受访者", "数据", "报告", "消息", "公告", "机构预估", "显然",
+    "上市公司", "归属于",
+    "同期", "上年同期", "去年同期", "去年", "今年", "前年", "明年",
+    "本月", "上月", "本周", "上周", "当日", "当天",
+    "预计", "预告", "估算", "测算", "财年", "季度", "年度", "月份", "成交",
+)
+_DETERMINER_HEADS = ("三款", "两款", "多款", "几款", "一些", "部分", "多个", "各", "每", "某些", "若干")
+_DEICTIC_ANY = ("两者", "二者", "前者", "后者", "各自", "其中", "该公司", "该产品", "该基金", "该车型", "该指数")
+_CONJ = "及和与、/"
+_STRIP_WORDS = tuple(
+    sorted(
+        set(_METRIC_WORDS) | set(_PRED_TAIL) | set(_SCOPE_WORDS) | set(_MOD_HEAD),
+        key=lambda w: (-len(w), w),
+    )
+)
+
+
+def _question_left(question: str) -> str:
+    """去掉疑问词和紧贴数字的线索词，留下主体+修饰语。"""
+    q = (question or "").rstrip("？?")
+    for tail in ("多少", "是在什么时候"):
+        if q.endswith(tail):
+            q = q[: -len(tail)]
+            break
+    for cue in sorted(set(_CUES) | set(_PRED_TAIL), key=lambda w: (-len(w), w)):
+        if q.endswith(cue):
+            q = q[: -len(cue)]
+            break
+    return q
+
+
+def _strip_modifiers(left: str) -> str:
+    changed = True
+    while changed:
+        changed = False
+        m = _TIME_HEAD.match(left)
+        if m:
+            left, changed = left[m.end():], True
+        for word in _MOD_HEAD:
+            if left.startswith(word):
+                left, changed = left[len(word):], True
+        if left.endswith("的"):
+            left, changed = left[:-1], True
+    return left.strip()
+
+
+def _nominal_part(part: str) -> str:
+    """把指标/谓词/范围/时间修饰词从片段两端剥掉，剩下主体；只剩这些词时返回空串。
+
+    必须整词匹配后再剥：早先按子串判断把"三星电子...营收"误当成只有"营收"，
+    结果真主体被当成缺主体整批丢弃。
+    """
+    part = part.strip()
+    while part:
+        if (
+            part in _GENERIC_HEADS
+            or part in _METRIC_WORDS
+            or part in _SCOPE_WORDS
+            or part in _PRED_TAIL
+            or part in _MOD_HEAD
+            or part == "中"
+        ):
+            return ""
+        m = _TIME_TAIL.search(part)
+        if m and m.start() > 0:
+            part = part[: m.start()]
+            continue
+        if part.endswith("的") and len(part) > 1:
+            part = part[:-1]
+            continue
+        for word in _STRIP_WORDS:
+            if part.startswith(word) and len(part) > len(word):
+                part = part[len(word) :]
+                break
+            if part.endswith(word) and len(part) > len(word):
+                part = part[: -len(word)]
+                break
+        else:
+            break
+    return part
+
+
+def _has_nominal(question: str) -> bool:
+    """问句里是否还剩一个非指标、非范围词的主体。"""
+    core = _strip_modifiers(_question_left(question))
+    if not core:
+        return False
+    if any(word in core for word in _DEICTIC_ANY):
+        return False
+    if core.startswith(_DETERMINER_HEADS):
+        return False
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9+.\-_]{1,}|[\u4e00-\u9fff]{2,}", core):
+        if re.match(r"[A-Za-z]", token):
+            return True
+        for part in re.split(rf"[{_CONJ}]", token):
+            if len(_nominal_part(part)) >= 2:
+                return True
+    return False
+
+
+def _subjectless(question: str) -> bool:
+    """单看问句无法定位主体（"9月环比走高多少""最新市值升至多少"）。"""
+    return not _has_nominal(question)
+
 
 
 def _figures(sent: str, m: re.Match) -> list[str]:
@@ -411,6 +574,8 @@ def _underspecified(question: str) -> bool:
         return True
     if re.search(r"从[^？?]*的多少[？?]?$", question):
         return True
+    if _subjectless(question):
+        return True
     q = question.rstrip("？?")
     left = q[:-2] if q.endswith("多少") else q
     if left.startswith(_DEICTIC_HEADS) or left.startswith(_GENERIC_HEADS):
@@ -615,6 +780,427 @@ def build_absent_items(joined: str, cap: int = 250) -> list[dict]:
     return out
 
 
+# 两跳题只合并「问的是同一类量」的事实：
+# - 平铺指标（是多少 / 为多少 / 多少）可以互换，合并后用“分别是多少”；
+# - 变动、阈值谓词（升至多少 / 突破多少 / 增长多少）必须两边逐字一致。
+# 否则合并会改变语义："股价下跌多少" + "股价上涨多少" 不等于 "股价分别是多少"。
+_LEVEL_PREDICATES = (
+    "分别是多少",
+    "大约为多少",
+    "大约是多少",
+    "约为多少",
+    "是多少",
+    "为多少",
+    "有多少",
+    "多少",
+)
+_OTHER_PREDICATES = (
+    "攀升至多少",
+    "回落至多少",
+    "升至多少",
+    "降至多少",
+    "涨至多少",
+    "跌至多少",
+    "增至多少",
+    "减至多少",
+    "上涨多少",
+    "下跌多少",
+    "走高多少",
+    "回落多少",
+    "增长多少",
+    "下降多少",
+    "提升多少",
+    "减少多少",
+    "增加多少",
+    "收窄多少",
+    "扩大多少",
+    "突破多少",
+    "超过多少",
+    "达到多少",
+    "净流入多少",
+    "净流出多少",
+    "蒸发多少",
+    "减持多少",
+    "增持多少",
+    "报多少",
+    "多少钱",
+)
+_HOP_PREDICATES = tuple(
+    sorted(set(_LEVEL_PREDICATES) | set(_OTHER_PREDICATES), key=lambda w: (-len(w), w))
+)
+
+# 左半句必须以指标名词收尾，并且能独立成名词短语。价值/表现/融资这类词
+# 即使能接“是多少”，也不是可比的指标，排除掉避免把"据报道价值"拼进题面。
+_HOP_METRIC_TAILS = tuple(
+    sorted(
+        (
+            set(_METRIC_WORDS)
+            | {
+                "持股比例", "注册资本", "平均利率", "年化利率", "达标率", "覆盖率",
+                "净利率", "毛利率", "市占率", "增长率", "费用率", "分红率", "成交额",
+                "成交均价", "吸金规模", "装机量", "新增装机", "订单金额", "合同金额",
+                "融资额", "出厂价", "零售价", "批发价", "发行价", "储备", "持仓", "仓位",
+                "渗透率", "转化率", "产能", "产量", "出货量", "发货量", "销售额", "净营收",
+                "总市值", "市值", "估值", "股价", "净值", "份额", "占比", "比例", "概率",
+                "收益率", "数量", "金额", "余额", "规模", "体量", "价格", "售价", "均价",
+                "成本", "费用", "利率", "上限", "下限", "面积", "容量", "电量", "密度",
+                "效率", "良率", "次数", "中位数",
+            }
+        )
+        - {"价值", "表现", "融资", "代码", "排名", "评分", "定价", "价款", "净额", "总额"},
+        key=lambda w: (-len(w), w),
+    )
+)
+# 出现这些片段说明左半句还是从句/指代/比较结构，不能直接接"分别是多少"
+_HOP_BAD_ANY = (
+    "可能", "据报道", "就曾", "是在", "目标", "承诺", "表示", "宣布", "标价", "相比",
+    "相较", "对比", "达成", "累计减持", "增持", "减持", "买入", "卖出", "加息的",
+    "共有", "一度", "分别", "实现", "预计", "计划", "市场预计", "市场预期",
+    # 指代词在上文，单看两跳题不知道说的是谁
+    "该公司", "该产品", "该品种", "该股", "该基金", "该业务", "该行", "该款",
+)
+# 以动词开头的左半句，主体已经丢了（"参股易方达基金非货体量"）
+_HOP_VERB_HEAD = (
+    "参股", "持股", "收购", "入股", "出售", "增持", "减持", "买入", "卖出", "达成",
+    "签署", "实现", "预计", "计划", "拟", "将", "曾", "已",
+)
+# 以时间/序数/泛指/指代开头，单看问句不知道说的是谁
+_HOP_BAD_HEAD = re.compile(
+    r"^(\d|第|首|这|那|该|其|此|同|上述|前者|后者|部分|整体|全部|所有|累计|平均|总|综合|"
+    r"全市场|今年|去年|明年|本月|上月|同期|一度)"
+)
+_HOP_HEAD_WORDS = tuple(
+    sorted(set(_SCOPE_WORDS) | set(_MOD_HEAD) | {"总", "综合"}, key=lambda w: (-len(w), w))
+)
+_HOP_TERM_SPLIT = re.compile(r"[的在中对占加及与和或、，,\s]+|\d{1,2}月|第?[一二三四]季度|\d{4}年")
+
+
+def _split_fact_question(question: str) -> tuple[str, str]:
+    """把事实题拆成「主体+指标」和「提问谓词」，谓词必须原样保留。"""
+    q = (question or "").strip().rstrip("？?")
+    for pred in _HOP_PREDICATES:
+        if q.endswith(pred) and len(q) > len(pred):
+            return q[: -len(pred)].strip("，,、；; "), pred
+    return "", ""
+
+
+def _hop_left_ok(left: str) -> bool:
+    """左半句必须是一个带主体的名词短语，否则两跳题会读不通。"""
+    left = left.strip("，,、；; ")
+    if not 4 <= len(left) <= 30:
+        return False
+    if any(m in left for m in _HOP_BAD_ANY) or left.startswith(_HOP_VERB_HEAD):
+        return False
+    if _HOP_BAD_HEAD.match(left):
+        return False
+    if re.search(r"(?:总部|区域|地区|国内|海外|全国|中国)加", left):
+        return False
+    tail = next((t for t in _HOP_METRIC_TAILS if left.endswith(t)), "")
+    if not tail:
+        return False
+    prefix = left[: -len(tail)].rstrip("的").strip()
+    if len(prefix) < 2:
+        return False
+    # 去掉开头的泛指/修饰词后仍要剩下一个实体（"全球"/"总"/"该"都不算）
+    core = prefix
+    changed = True
+    while changed and core:
+        changed = False
+        for word in _HOP_HEAD_WORDS:
+            if core.startswith(word) and len(core) > len(word):
+                core = core[len(word) :]
+                changed = True
+                break
+    return len(core) >= 2
+
+
+def _hop_pred_compatible(pred1: str, pred2: str) -> bool:
+    if pred1 in _LEVEL_PREDICATES and pred2 in _LEVEL_PREDICATES:
+        return True
+    return pred1 == pred2
+
+
+def _join_lefts(left1: str, left2: str, pred: str) -> str:
+    """把两个事实的问句左半句合成一道两跳题，公共主体只写一次。"""
+    left1 = left1.strip("，,、；; ")
+    left2 = left2.strip("，,、；; ")
+    if not left1 or not left2 or left1 == left2:
+        return ""
+    n = 0
+    for a, b in zip(left1, left2):
+        if a != b:
+            break
+        n += 1
+    if n >= 3:
+        left2 = left2[n:].lstrip("的")
+    if len(left2) < 2:
+        return ""
+    tail = "分别是多少？" if pred in _LEVEL_PREDICATES else f"分别{pred}？"
+    q = re.sub(r"\s+", "", f"{left1}、{left2}{tail}")
+    return q if 8 <= len(q) <= 72 else ""
+
+
+def _hop_terms(left: str) -> list[str]:
+    """取左半句里可用来找「同一页复述」的实词（去掉指标尾词与时间）。"""
+    core = left
+    for tail in _HOP_METRIC_TAILS:
+        if core.endswith(tail):
+            core = core[: -len(tail)]
+            break
+    parts = [p for p in _HOP_TERM_SPLIT.split(core) if len(p) >= 2]
+    return list(dict.fromkeys(parts))[:6]
+
+
+def _has_value(low: str, value: str) -> bool:
+    return any(_norm_value(m.group(0)) == value for m in _VALUE.finditer(low))
+
+
+def _pair_pages(
+    left1: str, left2: str, figs1: list[str], figs2: list[str], lows: list[str], known: set[int]
+) -> list[int]:
+    """同一页同时复述两处事实时也标成 gold——标准答案不只有来源页。
+
+    只在有原语料时生效：脱敏集升级没有页文本，gold 只能沿用两跳各自已展开的页集。
+    """
+    if not lows:
+        return []
+    terms1, terms2 = _hop_terms(left1), _hop_terms(left2)
+    values = [v for v in (_norm_value(f) for f in (figs1[:1] + figs2[:1])) if v]
+    if len(values) < 2 or not terms1 or not terms2:
+        return []
+    extra = []
+    for page, low in enumerate(lows, start=1):
+        if page in known:
+            continue
+        if not all(_has_value(low, v) for v in values):
+            continue
+        if not any(t in low for t in terms1) or not any(t in low for t in terms2):
+            continue
+        extra.append(page)
+    return extra
+
+
+def _hop_fields(a: dict, b: dict, extra_pages: list[int] | None = None) -> dict:
+    pages = sorted(
+        set(a.get("gold_pages") or []) | set(b.get("gold_pages") or []) | set(extra_pages or [])
+    )
+    spans = []
+    for it in (a, b):
+        spans += it.get("gold_spans") or ([it["gold_span"]] if it.get("gold_span") else [])
+    figs = [f for f in dict.fromkeys((a.get("gold_figures") or []) + (b.get("gold_figures") or []))]
+    return {
+        "gold_pages": pages,
+        "gold_span": [min(pages), max(pages)] if pages else [],
+        "gold_spans": [list(s) for s in dict.fromkeys(tuple(s) for s in spans)],
+        "gold_figures": figs[:4],
+        "hops": [
+            {"pages": sorted(set(a.get("gold_pages") or [])), "figures": (a.get("gold_figures") or [])[:2]},
+            {"pages": sorted(set(b.get("gold_pages") or [])), "figures": (b.get("gold_figures") or [])[:2]},
+        ],
+    }
+
+
+def derive_multihop(
+    items: list[dict], cap: int = 200, per_article: int = 2, lows: list[str] | None = None
+) -> list[dict]:
+    """同一篇文章里两个不同事实 → 一道两跳题：两处证据都要读到、两个数字都要答对。
+
+    只合并谓词兼容的事实：平铺指标互换为"分别是多少"，变动/阈值谓词必须逐字一致。
+    这样题目问的仍然是原事实的那个量，不会把"上涨多少"改写成"股价是多少"。
+    lows 传入原语料时可以补标「同时复述两处事实」的页面；脱敏集升级没有页文本。
+    """
+    by_art: dict[str, list[dict]] = {}
+    parsed: dict[str, tuple[str, str]] = {}
+    for it in items:
+        if it.get("tier") not in ("A", "B", "S") or it.get("kind") not in ("literal", "para"):
+            continue
+        if not it.get("gold_pages") or not it.get("gold_figures"):
+            continue
+        left, pred = _split_fact_question(it["question"])
+        if not left or not _hop_left_ok(left):
+            continue
+        parsed[it["id"]] = (left, pred)
+        by_art.setdefault(it.get("article") or it["id"], []).append(it)
+    out = []
+    for art, group in sorted(by_art.items()):
+        group = sorted(group, key=lambda x: x["id"])
+        pairs = [(group[i], group[j]) for i in range(len(group)) for j in range(i + 1, len(group))]
+        # 优先取分布在不同页的两处证据，同页配对留作兜底
+        pairs.sort(
+            key=lambda p: (
+                bool(set(p[0].get("gold_pages") or []) & set(p[1].get("gold_pages") or [])),
+                p[0]["id"],
+                p[1]["id"],
+            )
+        )
+        made = 0
+        seen: set[str] = set()
+        for a, b in pairs:
+            fa, fb = a.get("gold_figures") or [], b.get("gold_figures") or []
+            if not fa or not fb or _norm_value(fa[0]) == _norm_value(fb[0]):
+                continue
+            left_a, pred_a = parsed[a["id"]]
+            left_b, pred_b = parsed[b["id"]]
+            if not _hop_pred_compatible(pred_a, pred_b):
+                continue
+            pred = "多少" if pred_a in _LEVEL_PREDICATES and pred_b in _LEVEL_PREDICATES else pred_a
+            q = _join_lefts(left_a, left_b, pred)
+            if not q or q in seen or _subjectless(q):
+                continue
+            seen.add(q)
+            extra = _pair_pages(
+                left_a,
+                left_b,
+                fa,
+                fb,
+                lows or [],
+                set(a.get("gold_pages") or []) | set(b.get("gold_pages") or []),
+            )
+            out.append(
+                {
+                    "id": f"H-{art}-{_sid(q)}",
+                    "tier": "H",
+                    "kind": "multihop",
+                    "question": q,
+                    "article": art,
+                    "date": a.get("date") or b.get("date") or "",
+                    "subject": art,
+                    "anchor_terms": anchor_terms(q),
+                    "lex_hit": False,
+                    "expect_refusal": False,
+                    **_hop_fields(a, b, extra),
+                }
+            )
+            made += 1
+            if made >= per_article:
+                break
+        if len(out) >= cap:
+            break
+    return out[:cap]
+
+
+def derive_multiturn(items: list[dict], cap: int = 150, per_subject: int = 2) -> list[dict]:
+    """同一主体的两个事实 → 两轮对话：第二轮省掉主语，靠历史补全。
+
+    按「问句开头的主体」分组而不是按文章分组：同一家公司的事实常分散在多篇里，
+    "那三季度营收是多少" 正好考跨文章沿用上下文。
+    """
+    groups: dict[str, list[dict]] = {}
+    for it in items:
+        if it.get("tier") not in ("A", "B", "S") or it.get("kind") not in ("literal", "para"):
+            continue
+        if not it.get("gold_pages") or not it.get("gold_figures"):
+            continue
+        q = it["question"]
+        subject = question_subject(q)
+        if len(subject) < 2 or not q.startswith(subject) or _subjectless(q):
+            continue
+        it = {**it, "_subject": subject}
+        groups.setdefault(subject, []).append(it)
+    out = []
+    for subject, group in sorted(groups.items()):
+        group = sorted(group, key=lambda x: x["id"])
+        made = 0
+        seen_turn2: set[str] = set()
+        for i, a in enumerate(group):
+            for b in group[i + 1 :]:
+                fa, fb = a.get("gold_figures") or [], b.get("gold_figures") or []
+                if not fa or not fb or _norm_value(fa[0]) == _norm_value(fb[0]):
+                    continue
+                q1, q2 = a["question"], b["question"]
+                if q1 == q2 or _subjectless(q2):
+                    continue
+                rest = q2[len(subject) :].lstrip("的，,、 ")
+                if len(rest) < 4 or not any(w in rest for w in _METRIC_WORDS):
+                    continue
+                # “分别为多少”本身指代多个值，接在“那”后面读不通
+                if "分别" in rest:
+                    continue
+                # 带单位/百分号的数字等于把答案写进追问；日期数字（9月）允许保留
+                if re.search(
+                    r"\d[\d,，.]*\s*(?:%|％|万亿|亿|万|元|美元|港元|倍|台|辆|股|人|吨|GW|GB|TB)",
+                    rest,
+                ):
+                    continue
+                # 追问必须直接从时间或指标接上，否则说明中间还夹着别的成分
+                if not (
+                    re.match(r"^\d|[一二三四]季度|^第[一二三四]季度|^上半年|^下半年|^全年|^本季度|^当季|^同比|^环比", rest)
+                    or any(rest.startswith(w) for w in _METRIC_WORDS)
+                ):
+                    continue
+                turn2 = "那" + rest
+                if not _subjectless(turn2) or turn2 in seen_turn2:
+                    continue
+                seen_turn2.add(turn2)
+                out.append(
+                    {
+                        "id": f"M-{_sid(subject)}-{_sid(q1 + '|' + turn2)}",
+                        "tier": "M",
+                        "kind": "multiturn",
+                        "question": q1,
+                        "article": a.get("article") or "",
+                        "date": a.get("date") or b.get("date") or "",
+                        "subject": subject,
+                        "anchor_terms": anchor_terms(q1),
+                        "lex_hit": False,
+                        "expect_refusal": False,
+                        "turns": [
+                            {
+                                "question": q1,
+                                "gold_pages": sorted(set(a.get("gold_pages") or [])),
+                                "gold_span": a.get("gold_span") or [],
+                                "gold_spans": a.get("gold_spans") or [],
+                                "gold_figures": (a.get("gold_figures") or [])[:2],
+                            },
+                            {
+                                "question": turn2,
+                                "gold_pages": sorted(set(b.get("gold_pages") or [])),
+                                "gold_span": b.get("gold_span") or [],
+                                "gold_spans": b.get("gold_spans") or [],
+                                "gold_figures": (b.get("gold_figures") or [])[:2],
+                            },
+                        ],
+                        **_hop_fields(a, b),
+                    }
+                )
+                made += 1
+                if made >= per_subject:
+                    break
+            if made >= per_subject:
+                break
+        if len(out) >= cap:
+            break
+    return out[:cap]
+
+
+def upgrade_items(items: list[dict]) -> tuple[list[dict], dict[str, int]]:
+    """在已有脱敏验证集上升级：剔除缺主体问法，并由事实题派生多跳/多轮档。
+
+    原始语料缺失时能做的只有这两件事——H/M 的 gold 都来自原题字段，
+    不需要回到原文；也因此 M 档数量受「同主体、不同指标、问法平行」的存量限制。
+    """
+    kept = [it for it in items if not _subjectless(it.get("question") or "")]
+    dropped = len(items) - len(kept)
+    multihop = derive_multihop(kept)
+    multiturn = derive_multiturn(kept)
+    derived = multihop + multiturn
+    max_no = max((int(it.get("no") or 0) for it in kept), default=0)
+    doc_id = kept[0].get("doc_id") if kept else "src_0001"
+    for n, it in enumerate(derived, start=1):
+        max_no += 1
+        it["no"] = max_no
+        it["doc_id"] = it.get("doc_id") or doc_id
+        # 公开集不含 subject 字段；派生题的主体已经写在问句里，无需额外保留
+        it.pop("subject", None)
+    return kept + derived, {
+        "input": len(items),
+        "subjectless_dropped": dropped,
+        "kept": len(kept),
+        "multihop": len(multihop),
+        "multiturn": len(multiturn),
+    }
+
+
 def quota(items: list[dict], per_tier: dict[str, int], rng: random.Random, total: int = 1000) -> list[dict]:
     """按档位抽样；某档池子不够时用剩余档位补齐到 total，避免验证集缩水。"""
     pools = {t: [i for i in items if i["tier"] == t] for t in per_tier}
@@ -652,11 +1238,13 @@ def build_dataset(
     dropped = sum(1 for i in facts if i["ambiguous"])
     facts = [i for i in facts if not i["ambiguous"]]
     facts, refine = refine_questions(facts)
+    multihop = derive_multihop(facts, lows=lows)
+    multiturn = derive_multiturn(facts)
     timeline = build_timeline_items(arts)
     absent = build_absent_items(joined)
     items = quota(
-        facts + timeline + absent,
-        per_tier or {"A": 200, "B": 200, "S": 300, "C": 180, "D": 120},
+        facts + multihop + multiturn + timeline + absent,
+        per_tier or {"A": 180, "B": 180, "S": 280, "H": 60, "M": 60, "C": 180, "D": 60},
         rng,
     )
     for n, it in enumerate(items, start=1):
@@ -680,6 +1268,8 @@ def build_dataset(
         "candidate_b": sum(1 for i in facts if i["tier"] == "B"),
         "candidate_s": sum(1 for i in facts if i["tier"] == "S"),
         "candidate_timeline": len(timeline),
+        "candidate_multihop": len(multihop),
+        "candidate_multiturn": len(multiturn),
         "candidate_absent": len(absent),
         "items": items,
     }

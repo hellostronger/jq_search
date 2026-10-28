@@ -31,6 +31,13 @@ _REFUSE = re.compile(
     r"(未提及|未收录|未明确|未给出|未披露|未出现|未找到|未见|未包含|不包含|没有.*找到|没有.*相关"
     r"|找不到|证据不足|无法回答|文档中没)"
 )
+# 缺主体题的合格回答必须主动反问；只写"具体公司为X"不算，避免把猜到的答案当追问
+_CLARIFY = re.compile(
+    r"(请补充|请提供|请明确|请说明具体|需追问|需要(?:您|你)?(?:补充|明确|说明|确认)"
+    r"|您(?:指的|说的是)|你(?:指的|说的是)|能否(?:补充|明确)|麻烦(?:补充|明确)"
+    r"|(?:请问|请确认)[^。！？\n]{0,24}(?:哪家|哪个|哪款|哪只|哪一年|具体|范围)"
+    r"|(?:哪家|哪个|哪款|哪只)[^。！？\n]{0,16}[？?])"
+)
 _NUM = re.compile(r"\d[\d,，.]*")
 
 
@@ -62,6 +69,7 @@ def grade(item: dict, result: dict, lows: list[str] | None = None) -> dict:
     )
     # 诚实拒答允许顺带引用邻近页（"没找到 X，只找到 Y [p234]"），不能当成幻觉
     refused = bool(_REFUSE.search(result.get("answer") or ""))
+    clarified = bool(_CLARIFY.search(result.get("answer") or ""))
     tier = item["tier"]
     recall = len(gold & got) / len(gold) if gold else 0.0
     spans = item.get("gold_spans") or []
@@ -95,6 +103,8 @@ def grade(item: dict, result: dict, lows: list[str] | None = None) -> dict:
             ok = figure_ok and recall >= 0.5 and not refused
     elif tier == "D":
         ok = refused
+    elif tier == "Q":
+        ok = clarified
     elif tier == "C":
         ok = coverage >= 0.5
     else:
@@ -110,13 +120,14 @@ def grade(item: dict, result: dict, lows: list[str] | None = None) -> dict:
         "near_page_hit": near_hit,
         "article_hit": article_hit,
         "citation_verifiable": verifiable,
-        "unsupported_citation": bool(got) and not grounded and not refused,
+        "unsupported_citation": tier != "Q" and bool(got) and not grounded and not refused,
         "gold_page_recall": round(recall, 3),
         "article_coverage": round(coverage, 3),
         "figure_hit": len(hit_all),
         "figure_total": len(figures),
         "refused": refused,
-        "grader": 4,
+        "clarified": clarified,
+        "grader": 5,
         "gold_pages": sorted(gold),
         "cited_pages": sorted(got),
         "read_pages": result.get("read_pages") or [],
@@ -527,6 +538,11 @@ def summarize(rows: list[dict]) -> dict[str, Any]:
             ),
             "near_page_hit_rate": round(sum(1 for g in group if g["near_page_hit"]) / len(group), 3),
             "refused_rate": round(sum(1 for g in group if g["refused"]) / len(group), 3),
+            "clarified_rate": (
+                round(sum(1 for g in group if g.get("clarified")) / len(group), 3)
+                if tier == "Q"
+                else None
+            ),
             "median_article_coverage": (
                 statistics.median(g.get("article_coverage") or 0 for g in group)
                 if tier == "C"
@@ -558,7 +574,7 @@ def summarize(rows: list[dict]) -> dict[str, Any]:
 
 
 def show_failures(path: Path, per_tier: int = 4) -> None:
-    for tier in ("A", "B", "S", "H", "M", "C", "D"):
+    for tier in ("A", "B", "S", "H", "M", "C", "D", "Q"):
         g = [r for r in map(_regrade, read_jsonl(path)) if r["tier"] == tier and not r["ok"]]
         if not g:
             continue
@@ -600,6 +616,10 @@ def _cause(row: dict) -> str:
             return "每轮都答对"
         if turns and any(turns):
             return f"多轮里只答对 {sum(turns)}/{len(turns)} 轮"
+    if row["tier"] == "Q":
+        return "正确追问" if row["ok"] else (
+            "未追问，引了别的页" if cited else "未追问，直接作答"
+        )
     if row["ok"] and row["page_hit"]:
         return "命中 gold 页"
     if row["ok"]:
@@ -628,7 +648,7 @@ def main(
     mode: str,
     workers: int = 4,
     limit: int = 0,
-    tiers: str = "A,B,S,H,M,C,D",
+    tiers: str = "A,B,S,H,M,C,D,Q",
     home: Path | None = None,
 ) -> None:
     items = read_jsonl(dataset_path)
@@ -640,6 +660,11 @@ def main(
         for t in want:
             picked.extend([i for i in items if i["tier"] == t][:per])
         items = picked
+    if mode in ("retrieval", "floor", "tree"):
+        # Q 档没有 gold 页，字面/目录探针没有可测的命中目标
+        items = [i for i in items if i["tier"] != "Q"]
+    if not items and mode != "report":
+        raise SystemExit(f"没有匹配的题目：tiers={tiers} mode={mode}")
     cfg = load_config(home)
     doc_id = items[0].get("doc_id") if items else "src_0001"
     if mode == "report":

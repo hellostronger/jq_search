@@ -21,6 +21,7 @@ from treewiki.eval.dataset import (
     build_factual_items,
     build_timeline_items,
     expand_duplicate_gold,
+    mark_clarify_items,
     refine_questions,
     quota,
     split_articles,
@@ -210,12 +211,65 @@ def test_sanitize_items_keeps_grading_fields_and_drops_prose():
             "gold_answer": "公募FOF成立门槛降至 5000 万元，规模压力显著缓解",
             "article_title": "公募FOF新规落地：一批产品宣布延长募集",
             "subject": "批产品宣布延长",
-        }
+        },
+        {
+            "id": "2",
+            "tier": "Q",
+            "expect": "clarify",
+            "question": "最新市值升至多少？",
+            "gold_pages": [],
+            "gold_figures": [],
+            "ref_pages": [77],
+            "ref_figures": ["1200"],
+        },
     ]
-    out = sanitize_items(items)[0]
-    assert "gold_answer" not in out and "article_title" not in out and "subject" not in out
-    assert out["gold_pages"] == [12] and out["gold_figures"] == ["5000"]
-    assert grade(out, {"answer": "门槛降至 5,000 万元", "citations": [{"pages": [12]}]})["ok"]
+    out = sanitize_items(items)
+    row = out[0]
+    assert "gold_answer" not in row and "article_title" not in row and "subject" not in row
+    assert row["gold_pages"] == [12] and row["gold_figures"] == ["5000"]
+    assert grade(row, {"answer": "门槛降至 5,000 万元", "citations": [{"pages": [12]}]})["ok"]
+    assert out[1]["expect"] == "clarify"
+    assert "ref_pages" not in out[1] and "ref_figures" not in out[1]
+
+
+def test_mark_clarify_items_clears_gold_and_keeps_reference():
+    from treewiki.eval.clarify import CLARIFY_QUESTIONS
+
+    items = [
+        {
+            "id": "1",
+            "tier": "S",
+            "kind": "para",
+            "question": CLARIFY_QUESTIONS[0],
+            "gold_pages": [12, 13],
+            "gold_span": [12, 13],
+            "gold_spans": [[12, 13]],
+            "gold_figures": ["1200"],
+            "gold_answer": "某公司市值升至 1200 亿元",
+            "lex_hit": False,
+        },
+        {"id": "2", "tier": "D", "question": "不存在的产品售价多少？", "gold_pages": []},
+    ]
+    assert mark_clarify_items(items) == 1
+    q, d = items
+    assert q["tier"] == "Q" and q["expect"] == "clarify" and q["kind"] == "ambiguous"
+    assert q["gold_pages"] == [] and q["gold_figures"] == []
+    assert q["ref_pages"] == [12, 13] and q["ref_figures"] == ["1200"]
+    assert "gold_span" not in q and "gold_spans" not in q and "expect_refusal" not in q
+    assert d["expect"] == "refuse"
+
+
+def test_grade_ambiguous_question_requires_a_follow_up_question():
+    item = {"id": "1", "tier": "Q", "question": "最新市值升至多少？", "gold_pages": [], "gold_figures": []}
+    ask = {"answer": "需追问：请补充具体公司/产品/指标或时间范围。", "citations": []}
+    ask_with_page = {"answer": "请问您指的是哪家公司的市值？", "citations": [{"doc_id": "d", "pages": [12]}]}
+    guess = {"answer": "最新市值为 1,234 亿元，来自宁德时代。", "citations": [{"doc_id": "d", "pages": [12]}]}
+    assert grade(item, ask)["ok"] is True
+    assert grade(item, ask)["clarified"] is True
+    assert grade(item, ask_with_page)["ok"] is True
+    assert grade(item, ask_with_page)["unsupported_citation"] is False
+    assert grade(item, guess)["ok"] is False
+    assert grade(item, guess)["clarified"] is False
 
 
 def test_grade_counts_hallucinated_citation_as_refusal_failure():

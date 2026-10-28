@@ -3,12 +3,13 @@
 标准引用不靠模型判断——语料里每篇文章由 **【文章 A####】** 标记切分，事实句落在
 哪一页是构造时已知的事实，所以 gold_pages 是确定量，可以直接算引用召回/精度。
 
-四档问题（tier 由生产代码的实测行为决定，不靠模板猜测）：
+五档问题（tier 由生产代码的实测行为决定，不靠模板猜测）：
   A 字面可命中：全部锚词都出现在标准页上
   B 字面不可命中：改写后锚词落空，只能靠树索引 + 摘要定位
   C 跨天聚合：同一实体在多天多篇出现，考时序梳理与多页引用
   D 未收录：语料里确实没有这个实体，考拒答而不是编造引用
       strict=实体串整本零命中；adjacent=实体串没有但锚词命中了别的产品（幻觉高危）
+  Q 缺主体：题干只剩通用指标/时间/指代，标准行为是先追问，不是猜一个数字
 
 派生档（由 A/B/S 题配对生成，gold 全部来自原题字段）：
   H 多跳：同一篇里两个不同事实合成一问，两处证据、两个数字都答对才算过
@@ -31,6 +32,7 @@ from typing import Any
 
 from ..core.store import KB
 from ..pipelines.query import anchor_terms, question_subject
+from .clarify import CLARIFY_ANSWER, CLARIFY_QUESTIONS
 
 MARKER = re.compile(r"\*\*【文章\s*(A\d{3,5})】(.+?)\*\*")
 _HEADER_DATE = re.compile(r"发布时间：(\d{4}-\d{2}-\d{2})")
@@ -1220,6 +1222,39 @@ def quota(items: list[dict], per_tier: dict[str, int], rng: random.Random, total
     return out
 
 
+_CLARIFY_KEYS = {_norm_text(q) for q in CLARIFY_QUESTIONS}
+
+
+def mark_clarify_items(items: list[dict], strict: bool = False) -> int:
+    """把缺主体的题改成追问题：标准行为是反问，不是从语料里随便挑一个数字。
+
+    原 gold 页与数字挪到 ref_* 仅供人工复核，评分不再要求命中它们。
+    """
+    matched = 0
+    for it in items:
+        it.setdefault("expect", "refuse" if it["tier"] == "D" else "answer")
+        if _norm_text(it["question"]) not in _CLARIFY_KEYS:
+            continue
+        matched += 1
+        it["ref_pages"] = sorted(it.get("gold_pages") or [])
+        it["ref_figures"] = list(it.get("gold_figures") or [])
+        it.update(
+            tier="Q",
+            kind="ambiguous",
+            gold_pages=[],
+            gold_answer=CLARIFY_ANSWER,
+            gold_figures=[],
+            lex_hit=False,
+            expect="clarify",
+        )
+        for key in ("gold_span", "gold_spans", "gold_articles", "gold_match", "gold_text", "expect_refusal"):
+            it.pop(key, None)
+    if strict and matched != len(_CLARIFY_KEYS):
+        missing = sorted(_CLARIFY_KEYS - {_norm_text(i["question"]) for i in items})
+        raise ValueError(f"{len(missing)} 条追问清单不在当前验证集里：{missing[:3]}")
+    return matched
+
+
 def build_dataset(
     kb: KB,
     doc_id: str,
@@ -1247,6 +1282,7 @@ def build_dataset(
         per_tier or {"A": 180, "B": 180, "S": 280, "H": 60, "M": 60, "C": 180, "D": 60},
         rng,
     )
+    clarify = mark_clarify_items(items, strict=True)
     for n, it in enumerate(items, start=1):
         it["no"] = n
         it["doc_id"] = doc_id
@@ -1271,12 +1307,13 @@ def build_dataset(
         "candidate_multihop": len(multihop),
         "candidate_multiturn": len(multiturn),
         "candidate_absent": len(absent),
+        "clarify": clarify,
         "items": items,
     }
 
 
 # 语料是有版权的公众号文章，公开版验证集只留判分需要的结构化字段
-_LEAKY_FIELDS = ("gold_answer", "gold_text", "article_title", "subject")
+_LEAKY_FIELDS = ("gold_answer", "gold_text", "article_title", "subject", "ref_pages", "ref_figures")
 
 
 def sanitize_items(items: list[dict]) -> list[dict]:

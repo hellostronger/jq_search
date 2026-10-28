@@ -215,6 +215,8 @@ def evalset(
     --public 去掉原文整句与文章标题，产出可公开提交的脱敏版。
     --upgrade 在已有脱敏集上剔除缺主体问法，并派生多跳（H）/多轮（M）档。
     """
+    from collections import Counter
+
     from .eval.dataset import (
         build_dataset,
         read_jsonl,
@@ -235,12 +237,15 @@ def evalset(
     ds = build_dataset(KB(kb_home()), doc_id, seed=seed)
     items = sanitize_items(ds["items"]) if public else ds["items"]
     write_jsonl(out, items)
+    counts = Counter(it["tier"] for it in ds["items"])
+    final = " · ".join(f"{t} {counts[t]}" for t in ("A", "B", "S", "C", "D", "Q") if counts[t])
     console.print(
-        f"[green]写出 {len(ds['items'])} 条 → {out}[/green]  "
+        f"[green]写出 {len(ds['items'])} 条 → {out}[/green]  {final}\n"
         f"文章 {ds['articles']} / 页 {ds['pages']} / 事实候选 {ds['candidate_facts']} "
         f"(A {ds['candidate_a']} · B {ds['candidate_b']} · S {ds['candidate_s']}) "
         f"时序 {ds['candidate_timeline']} 多跳 {ds['candidate_multihop']} "
         f"多轮 {ds['candidate_multiturn']} 未收录 {ds['candidate_absent']} "
+        f"缺主体转追问 {ds['clarify']} "
         f"重复并入 {ds['candidate_duplicate_gold']} · 冲突剔除 {ds['candidate_duplicate_conflict']} "
         f"同问并入 {ds['candidate_merged']} · 同问冲突 {ds['candidate_multi_answer']} "
         f"残句 {ds['candidate_bad_clause']} · 缺主体 {ds['candidate_underspecified']} "
@@ -255,7 +260,7 @@ def evalrun(
     mode: str = "retrieval",
     workers: int = 4,
     limit: int = 0,
-    tiers: str = "A,B,S,H,M,C,D",
+    tiers: str = "A,B,S,H,M,C,D,Q",
 ):
     """评测：retrieval/entity/tree/floor 零成本探针，full 并发调用真实模型跑端到端"""
     from .eval.runner import main as run

@@ -13,6 +13,8 @@ DEFAULTS: dict[str, Any] = {
         "api_key": "",
         "index_model": "gpt-4o-mini",
         "chat_model": "gpt-4o",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_api_key": "",
     },
     "mineru": {
         "token": "",
@@ -24,7 +26,7 @@ DEFAULTS: dict[str, Any] = {
     "index": {
         "summaries": True,
         "classic_batch": 8,
-        "summary_workers": 6,
+        "summary_workers": 1,
     },
     "wiki": {
         "enabled": True,
@@ -57,6 +59,23 @@ DEFAULTS: dict[str, Any] = {
         "query_expansion": True,
         "expand_limit": 6,
     },
+    "neo4j": {
+        "uri": "bolt://127.0.0.1:7687",
+        "user": "neo4j",
+        "password": "",
+        "database": "neo4j",
+        "embedding_model": "",
+        "embedding_api_key": "",
+        "embedding_batch": 16,
+        "embedding_timeout": 180,
+        "vector_k": 40,
+        "fulltext_k": 40,
+        "graph_k": 40,
+        "graph_entity_k": 12,
+        "rrf_k": 60,
+        "top_k": 30,
+        "entity_df_cap": 200,
+    },
 }
 
 
@@ -83,9 +102,28 @@ def _apply_env(cfg: dict) -> None:
         llm["base_url"] = os.environ["OPENAI_BASE_URL"]
     if not llm.get("api_key") and os.environ.get("OPENAI_API_KEY"):
         llm["api_key"] = os.environ["OPENAI_API_KEY"]
+    if not llm.get("embedding_api_key"):
+        llm["embedding_api_key"] = (
+            os.environ.get("EMBEDDING_API_KEY")
+            or os.environ.get("OPENAI_EMBEDDING_API_KEY")
+            or ""
+        )
+    if not llm.get("embedding_model") and os.environ.get("EMBEDDING_MODEL"):
+        llm["embedding_model"] = os.environ["EMBEDDING_MODEL"]
     mineru = cfg["mineru"]
     if not mineru.get("token") and os.environ.get("MINERU_API_TOKEN"):
         mineru["token"] = os.environ["MINERU_API_TOKEN"]
+    neo4j = cfg["neo4j"]
+    for key, env in (
+        ("uri", "NEO4J_URI"),
+        ("user", "NEO4J_USER"),
+        ("password", "NEO4J_PASSWORD"),
+        ("database", "NEO4J_DATABASE"),
+        ("embedding_model", "EMBEDDING_MODEL"),
+        ("embedding_api_key", "EMBEDDING_API_KEY"),
+    ):
+        if os.environ.get(env):
+            neo4j[key] = os.environ[env]
 
 
 def load_config(home: Path | None = None) -> dict:

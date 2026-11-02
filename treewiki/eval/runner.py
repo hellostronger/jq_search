@@ -24,6 +24,7 @@ from ..pipelines.query import (
     iter_nodes,
     query_raw,
     question_anchors,
+    run_query,
 )
 from .dataset import read_jsonl, write_jsonl
 
@@ -427,8 +428,9 @@ def run_full(
     items: list[dict],
     doc_id: str,
     out_path: Path,
-    workers: int = 4,
+    workers: int = 1,
     home: Path | None = None,
+    query_mode: str = "raw",
 ) -> list[dict]:
     cfg = load_config(home)
     done = {r["id"] for r in read_jsonl(out_path)}
@@ -442,28 +444,29 @@ def run_full(
             local.lows = [t.lower() for t in local.kb.read_pages(doc_id, 1, local.kb.page_count(doc_id))]
         return local.kb, local.llm, local.lows
 
+    def ask(item_doc: str, question: str, history: list[dict] | None, kb, llm):
+        if query_mode == "raw" or history is not None:
+            return query_raw(item_doc, question, kb, llm, cfg, history=history)
+        # wiki / cascade / parallel 目前没有 history 参数，带历史的多轮题只能走 raw
+        return run_query(question, kb, llm, cfg, mode=query_mode, doc_id=item_doc)
+
     def one(item: dict) -> dict:
         kb, llm, lows = deps()
         t0 = time.time()
+        before = llm.usage()
+        item_doc = item.get("doc_id") or doc_id
         try:
             if item.get("turns"):
                 results: list[dict] = []
                 history: list[dict] = []
                 for turn in item["turns"]:
-                    r = query_raw(
-                        item.get("doc_id") or doc_id,
-                        turn["question"],
-                        kb,
-                        llm,
-                        cfg,
-                        history=history,
-                    )
+                    r = ask(item_doc, turn["question"], history, kb, llm)
                     results.append(r)
                     history.append({"role": "user", "content": turn["question"]})
                     history.append({"role": "assistant", "content": r.get("answer") or ""})
                 row = grade_multiturn(item, results, lows)
             else:
-                result = query_raw(item.get("doc_id") or doc_id, item["question"], kb, llm, cfg)
+                result = ask(item_doc, item["question"], None, kb, llm)
                 row = grade(item, result, lows)
         except Exception as e:  # 评测里一条失败不该终止整轮
             row = {
@@ -474,6 +477,9 @@ def run_full(
                 row["turn_ok"] = [False] * len(item["turns"])
                 row["turn_count"] = len(item["turns"])
         row["seconds"] = round(time.time() - t0, 1)
+        row["query_mode"] = query_mode if not item.get("turns") else "raw"
+        after = llm.usage()
+        row["usage"] = {k: max(0, after[k] - before[k]) for k in after}
         return row
 
     rows = []
@@ -646,10 +652,11 @@ def main(
     dataset_path: Path,
     out_path: Path,
     mode: str,
-    workers: int = 4,
+    workers: int = 1,
     limit: int = 0,
     tiers: str = "A,B,S,H,M,C,D,Q",
     home: Path | None = None,
+    query_mode: str = "raw",
 ) -> None:
     items = read_jsonl(dataset_path)
     want = sorted({t.strip() for t in tiers.split(",") if t.strip()})
@@ -716,7 +723,15 @@ def main(
         write_jsonl(out_path, rows)
         print(json.dumps(_summarize_tree(rows), ensure_ascii=False, indent=2))
         return
-    rows = run_full(items, doc_id, out_path, workers, home)
+    if mode == "neo4j":
+        from .neo4j_probe import run_neo4j_probe, summarize_neo4j
+
+        kb = KB(kb_home_of(home))
+        rows = run_neo4j_probe(kb, items, cfg)
+        write_jsonl(out_path, rows)
+        print(json.dumps(summarize_neo4j(rows), ensure_ascii=False, indent=2))
+        return
+    rows = run_full(items, doc_id, out_path, workers, home, query_mode)
     all_rows = read_jsonl(out_path)
     print(json.dumps(summarize(all_rows), ensure_ascii=False, indent=2))
     print("\n失败归因：")

@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+baseline = ["neo4j>=5.16", "jieba>=0.42"]
 
 [project.scripts]
 tw = "treewiki.cli:main"

@@ -12,3 +12,7 @@ kb/
 # 评测中间产物（模型回答里带语料原文片段），只提交脱敏版验证集
 eval_out/*
 !eval_out/dataset_public.jsonl
+
+# 第三方源码树（901M）与原始语料（36M）：体积与版权都只留本地
+vendor/
+datasets/

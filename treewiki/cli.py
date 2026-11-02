@@ -20,7 +20,9 @@ from .pipelines.query import run_query
 
 app = typer.Typer(no_args_is_help=True, help="TreeWiki — LLMWiki × PageIndex 知识库")
 entities_app = typer.Typer(no_args_is_help=True, help="实体别名索引（图聚类）")
+neo4j_app = typer.Typer(no_args_is_help=True, help="Neo4j 三路混合检索基线")
 app.add_typer(entities_app, name="entities")
+app.add_typer(neo4j_app, name="neo4j")
 console = Console()
 
 
@@ -202,6 +204,70 @@ def entities_lookup(mention: str, top: int = typer.Option(5, "--top", "-n")):
     console.print("出现页: " + ", ".join(f"{d}#p{p}" for d, p in pages))
 
 
+@neo4j_app.command("build")
+def neo4j_build(
+    doc: Optional[List[str]] = typer.Option(None, "--doc", help="只重建指定 doc_id，可重复"),
+    rebuild: bool = typer.Option(True, "--rebuild/--append", help="先清空 TW* 节点再重建"),
+):
+    """建 Neo4j 图 + 向量索引 + 全文索引（会调用 embedding）"""
+    import json
+
+    from .pipelines.neo4j_hybrid import Neo4jHybrid
+
+    cfg = load_config()
+    kb = KB(kb_home())
+    with Neo4jHybrid(cfg, cache_dir=kb.home / "cache" / "embeddings", kb=kb) as hybrid:
+        stats = hybrid.build(
+            kb,
+            doc_ids=list(doc) if doc else None,
+            rebuild=rebuild,
+            stage=lambda s: console.print(s, markup=False),
+        )
+    console.print_json(json.dumps(stats, ensure_ascii=False))
+
+
+@neo4j_app.command("search")
+def neo4j_search(
+    question: str,
+    k: int = typer.Option(12, "--k", "-k", help="融合后返回页数"),
+):
+    """三路检索并打印每页来自哪几路、名次与 RRF 分数"""
+    import json
+
+    from .pipelines.neo4j_hybrid import Neo4jHybrid
+
+    cfg = load_config()
+    kb = KB(kb_home())
+    with Neo4jHybrid(cfg, cache_dir=kb.home / "cache" / "embeddings", kb=kb) as hybrid:
+        result = hybrid.search(question, k=k)
+    console.print(
+        f"[dim]分词: {' / '.join(result.get('terms') or [])} ｜ "
+        f"图中实体: {', '.join(result.get('graph_entities') or []) or '—'}[/dim]"
+    )
+    for name in ("vector", "fulltext", "graph"):
+        console.print(f"[bold]{name}[/bold]: {' '.join(result['channels'][name][:8]) or '—'}")
+    console.print("[bold]RRF[/bold]")
+    for rank, page in enumerate(result.get("pages") or [], start=1):
+        ranks = result["ranks"].get(page["id"], {})
+        mark = " ".join(f"{c}#{r}" for c, r in ranks.items())
+        preview = (page.get("preview") or "").replace("\n", " ")[:90]
+        console.print(
+            f"{rank:>2}. {page['id']} [dim]{mark} {result['scores'].get(page['id']):.5f}[/dim] "
+            f"{preview}"
+        )
+
+
+@neo4j_app.command("stats")
+def neo4j_stats():
+    """查看 Neo4j 里的页/实体/提及数量"""
+    from .pipelines.neo4j_hybrid import Neo4jHybrid
+
+    cfg = load_config()
+    kb = KB(kb_home())
+    with Neo4jHybrid(cfg, kb=kb) as hybrid:
+        console.print(hybrid.stats())
+
+
 @app.command()
 def evalset(
     out: Path = Path("eval_out/dataset.jsonl"),
@@ -258,14 +324,20 @@ def evalrun(
     dataset: Path = Path("eval_out/dataset.jsonl"),
     results: Path = Path("eval_out/retrieval.jsonl"),
     mode: str = "retrieval",
-    workers: int = 4,
+    workers: int = 1,
     limit: int = 0,
     tiers: str = "A,B,S,H,M,C,D,Q",
+    query_mode: str = typer.Option(
+        "raw", "--query-mode", help="raw / wiki / cascade / parallel（仅 full 模式生效）"
+    ),
 ):
-    """评测：retrieval/entity/tree/floor 零成本探针，full 并发调用真实模型跑端到端"""
+    """评测：retrieval/entity/tree/floor/neo4j 零成本探针，full 调用真实模型跑端到端
+
+    --workers 默认 1：网关同一 key 只允许约 1 个在途请求，并发上去只会 429/503。
+    """
     from .eval.runner import main as run
 
-    run(dataset, results, mode, workers, limit, tiers, kb_home())
+    run(dataset, results, mode, workers, limit, tiers, kb_home(), query_mode)
 
 
 def main():

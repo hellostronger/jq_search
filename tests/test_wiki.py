@@ -212,6 +212,24 @@ def test_distill_creates_pages_relations_and_stubs(kb):
     assert (store.root / "index.md").is_file() and store.tree_path.is_file()
 
 
+def test_distill_reuses_cached_extracts_without_calling_llm(kb):
+    payload = {
+        "summary": "财报摘要。",
+        "entities": [
+            {"name": "Acme", "type": "org", "claims": [{"claim": "收入 100 亿", "pages": [1]}]}
+        ],
+        "topics": [],
+        "relations": [],
+    }
+    assert distill_source("src_0001", kb, FakeLLM([payload]), _cfg())["batches"] == 1
+
+    again = FakeLLM([])  # 任何新的抽取调用都会在这里抛 IndexError
+    stats = distill_source("src_0001", kb, again, _cfg())
+    assert stats["reused"] == 1
+    assert again.calls == []
+    assert WikiStore(kb).load("ent_acme").citations[0]["claim"] == "收入 100 亿"
+
+
 def test_distill_is_idempotent(kb):
     payload = {
         "summary": "收入 100 亿。",

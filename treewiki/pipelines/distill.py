@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from ..core.llm import LLM
@@ -127,6 +129,104 @@ def _merge_claims(a: list[dict], b: list[dict]) -> list[dict]:
     return a
 
 
+def _batch_key(batch: list[dict]) -> str:
+    return "|".join(f"{item['start']}-{item['end']}" for item in batch)
+
+
+def _cache_file(kb: KB, doc_id: str) -> Path:
+    return kb.wiki_dir / "cache" / f"{doc_id}.jsonl"
+
+
+def _load_cache(path: Path) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict) and rec.get("key") and isinstance(rec.get("data"), dict):
+            out[rec["key"]] = rec["data"]
+    return out
+
+
+def _append_cache(path: Path, key: str, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"key": key, "data": data}, ensure_ascii=False) + "\n")
+
+
+def _absorb(
+    data: dict,
+    allowed: list[int],
+    doc_id: str,
+    entities: dict[str, dict],
+    topics: dict[str, dict],
+    relations: dict[tuple[str, str, str], dict],
+    summaries: list[str],
+) -> None:
+    """把一批抽取结果并进累计桶（与是否来自缓存无关）。"""
+    summary = str(data.get("summary") or "").strip()
+    if summary:
+        summaries.append(summary)
+
+    for e in data.get("entities") or []:
+        if not isinstance(e, dict):
+            continue
+        name = str(e.get("name") or "").strip()[:80]
+        if not name:
+            continue
+        pid = page_id_for(name, "entity")
+        entry = entities.setdefault(
+            pid,
+            {"title": name, "type": str(e.get("type") or "other")[:30],
+             "description": "", "aliases": [], "claims": [], "relations": []},
+        )
+        desc = str(e.get("description") or "").strip()
+        if desc and desc not in entry["description"]:
+            entry["description"] = (entry["description"] + "；" + desc).strip("；")[:600]
+        for a in e.get("aliases") or []:
+            a = str(a).strip()
+            if a and a != name and a not in entry["aliases"]:
+                entry["aliases"].append(a[:80])
+        _merge_claims(entry["claims"], _claims(e.get("claims"), allowed, doc_id))
+
+    for t in data.get("topics") or []:
+        if not isinstance(t, dict):
+            continue
+        name = str(t.get("name") or "").strip()[:80]
+        if not name:
+            continue
+        pid = page_id_for(name, "topic")
+        entry = topics.setdefault(
+            pid,
+            {"title": name, "type": "topic", "description": "", "aliases": [], "claims": []},
+        )
+        desc = str(t.get("description") or "").strip()
+        if desc and desc not in entry["description"]:
+            entry["description"] = (entry["description"] + "；" + desc).strip("；")[:600]
+        _merge_claims(entry["claims"], _claims(t.get("claims"), allowed, doc_id))
+
+    for r in data.get("relations") or []:
+        if not isinstance(r, dict):
+            continue
+        frm = str(r.get("from") or r.get("source") or "").strip()[:80]
+        to = str(r.get("to") or r.get("target") or "").strip()[:80]
+        pred = str(r.get("predicate") or r.get("relation") or "").strip()[:80]
+        if not (frm and to and pred):
+            continue
+        key = (frm, pred, to)
+        pages_r = _pages(r.get("pages"), allowed)
+        if key in relations:
+            relations[key]["pages"] = sorted(set(relations[key]["pages"]) | set(pages_r))
+        else:
+            relations[key] = {
+                "from": frm, "predicate": pred, "to": to,
+                "doc": doc_id, "pages": pages_r,
+            }
+
+
 def distill_source(
     doc_id: str,
     kb: KB,
@@ -144,6 +244,8 @@ def distill_source(
     leaf_chars = int(wcfg.get("leaf_chars", 3000))
     batch_chars = int(wcfg.get("batch_chars", 9000))
     max_batches = int(wcfg.get("max_batches", 30))
+    # 单批抽取要输出实体/主题/关系三份清单，4000 token 会被截断成非法 JSON
+    extract_max_tokens = int(wcfg.get("extract_max_tokens", 12000))
 
     batches = list(_batch_leaves(_leaves(tree), pages, leaf_chars, batch_chars))[:max_batches]
     if not batches:
@@ -154,91 +256,45 @@ def distill_source(
     relations: dict[tuple[str, str, str], dict] = {}
     summaries: list[str] = []
     failures: list[str] = []
+    # 抽取结果按批的页区间做键缓存：重跑时命中就不必再调模型，进程被停掉也不丢已完成批
+    cache_file = _cache_file(kb, doc_id)
+    cache = _load_cache(cache_file)
+    reused = 0
 
     for idx, batch in enumerate(batches, 1):
-        stage(f"wiki 蒸馏：批次 {idx}/{len(batches)}（{len(batch)} 个叶节点）…")
+        key = _batch_key(batch)
         allowed = sorted({p for item in batch for p in item["pages"]})
-        body = "\n\n".join(
-            f"【片段 {i}】{item['title']}（第 {item['start']}-{item['end']} 页）\n{item['text']}"
-            for i, item in enumerate(batch, 1)
-        )
-        try:
-            data = llm.chat_json(
-                [
-                    {"role": "system", "content": EXTRACT_SYS},
-                    {
-                        "role": "user",
-                        "content": EXTRACT_USER.format(
-                            doc_name=doc_name, hint=hint or "（无）", body=body
-                        ),
-                    },
-                ],
-                model=cfg["llm"]["index_model"],
-                max_tokens=4000,
+        data = cache.get(key)
+        if data is None:
+            stage(f"wiki 蒸馏：批次 {idx}/{len(batches)}（{len(batch)} 个叶节点）…")
+            body = "\n\n".join(
+                f"【片段 {i}】{item['title']}（第 {item['start']}-{item['end']} 页）\n{item['text']}"
+                for i, item in enumerate(batch, 1)
             )
-        except Exception as e:  # noqa: BLE001
-            failures.append(f"批次 {idx}: {e}")
-            stage(f"wiki 蒸馏：批次 {idx} 失败，跳过（{e}）")
-            continue
-
-        summary = str(data.get("summary") or "").strip()
-        if summary:
-            summaries.append(summary)
-
-        for e in data.get("entities") or []:
-            if not isinstance(e, dict):
+            try:
+                data = llm.chat_json(
+                    [
+                        {"role": "system", "content": EXTRACT_SYS},
+                        {
+                            "role": "user",
+                            "content": EXTRACT_USER.format(
+                                doc_name=doc_name, hint=hint or "（无）", body=body
+                            ),
+                        },
+                    ],
+                    model=cfg["llm"]["index_model"],
+                    max_tokens=extract_max_tokens,
+                )
+            except Exception as e:  # noqa: BLE001
+                failures.append(f"批次 {idx}: {e}")
+                stage(f"wiki 蒸馏：批次 {idx} 失败，跳过（{e}）")
                 continue
-            name = str(e.get("name") or "").strip()[:80]
-            if not name:
-                continue
-            pid = page_id_for(name, "entity")
-            entry = entities.setdefault(
-                pid,
-                {"title": name, "type": str(e.get("type") or "other")[:30],
-                 "description": "", "aliases": [], "claims": [], "relations": []},
-            )
-            desc = str(e.get("description") or "").strip()
-            if desc and desc not in entry["description"]:
-                entry["description"] = (entry["description"] + "；" + desc).strip("；")[:600]
-            for a in e.get("aliases") or []:
-                a = str(a).strip()
-                if a and a != name and a not in entry["aliases"]:
-                    entry["aliases"].append(a[:80])
-            _merge_claims(entry["claims"], _claims(e.get("claims"), allowed, doc_id))
-
-        for t in data.get("topics") or []:
-            if not isinstance(t, dict):
-                continue
-            name = str(t.get("name") or "").strip()[:80]
-            if not name:
-                continue
-            pid = page_id_for(name, "topic")
-            entry = topics.setdefault(
-                pid,
-                {"title": name, "type": "topic", "description": "", "aliases": [], "claims": []},
-            )
-            desc = str(t.get("description") or "").strip()
-            if desc and desc not in entry["description"]:
-                entry["description"] = (entry["description"] + "；" + desc).strip("；")[:600]
-            _merge_claims(entry["claims"], _claims(t.get("claims"), allowed, doc_id))
-
-        for r in data.get("relations") or []:
-            if not isinstance(r, dict):
-                continue
-            frm = str(r.get("from") or r.get("source") or "").strip()[:80]
-            to = str(r.get("to") or r.get("target") or "").strip()[:80]
-            pred = str(r.get("predicate") or r.get("relation") or "").strip()[:80]
-            if not (frm and to and pred):
-                continue
-            key = (frm, pred, to)
-            pages_r = _pages(r.get("pages"), allowed)
-            if key in relations:
-                relations[key]["pages"] = sorted(set(relations[key]["pages"]) | set(pages_r))
-            else:
-                relations[key] = {
-                    "from": frm, "predicate": pred, "to": to,
-                    "doc": doc_id, "pages": pages_r,
-                }
+            _append_cache(cache_file, key, data)
+            cache[key] = data
+        else:
+            reused += 1
+            stage(f"wiki 蒸馏：批次 {idx}/{len(batches)} 复用缓存（第 {allowed[0]}-{allowed[-1]} 页）")
+        _absorb(data, allowed, doc_id, entities, topics, relations, summaries)
 
     if len(failures) == len(batches):
         raise RuntimeError("wiki 蒸馏全部失败：" + "；".join(failures[:3]))
@@ -312,6 +368,7 @@ def distill_source(
         "topics": len(topics),
         "relations": len(relations),
         "batches": len(batches),
+        "reused": reused,
         "failed": len(failures),
         "pages": tree_data["page_count"],
     }

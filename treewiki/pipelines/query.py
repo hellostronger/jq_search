@@ -764,6 +764,43 @@ COMPARE_SYS = """你在核对两条问答结果：一条来自 wiki 蒸馏层，
 _LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
 
+def _question_grams(question: str) -> set[str]:
+    """问句的字面片段：拉丁词整取，中文取 2-4 字滑窗（只用于打分召回，不作命中条件）。"""
+    grams: set[str] = set()
+    for t in _LATIN_TERM.findall(question):
+        if len(t) >= 3:
+            grams.add(t.lower())
+    for run in _CJK_RUN.findall(question):
+        for n in (2, 3, 4):
+            for i in range(len(run) - n + 1):
+                grams.add(run[i : i + n])
+    return grams
+
+
+def _wiki_rank(pages: list[WikiPage], question: str, top: int) -> list[WikiPage]:
+    """几千页的目录不能整份交给选择器，先按问句字面重叠召回前 top 篇。"""
+    grams = _question_grams(question)
+    sources = [p for p in pages if p.type == "source"]
+    if not grams:
+        return (sources + pages)[:top]
+    scored: list[tuple[int, WikiPage]] = []
+    for p in pages:
+        if p.type == "source":
+            continue
+        head = (p.title + " " + " ".join(p.aliases)).lower()
+        body = (
+            p.summary + " " + p.description + " "
+            + " ".join(str(c.get("claim") or "") for c in p.citations)
+        ).lower()
+        score = 3 * sum(1 for g in grams if g in head) + sum(1 for g in grams if g in body)
+        if score:
+            scored.append((score, p))
+    if not scored:
+        return (sources + pages)[:top]
+    scored.sort(key=lambda x: -x[0])
+    return (sources + [p for _, p in scored])[:top]
+
+
 def _wiki_listing(pages: list[WikiPage], doc_id: str | None) -> str:
     lines: list[str] = []
     for p in pages[:120]:
@@ -917,12 +954,18 @@ def query_wiki(
         }
 
     limit = int(qcfg.get("wiki_max_pages", 8))
+    listing_top = int(qcfg.get("wiki_listing_top", 30))
+    candidates = _wiki_rank(pages, question, listing_top)
     data = llm.chat_json(
         [
             {"role": "system", "content": WIKI_SELECT_SYS.format(limit=limit)},
             {
                 "role": "user",
-                "content": f"问题：{question}\n\nwiki 页面录：\n{_wiki_listing(pages, doc_id)}",
+                "content": (
+                    f"问题：{question}\n\nwiki 页面录"
+                    f"（全库 {len(pages)} 页，以下 {len(candidates)} 页为字面召回候选）：\n"
+                    f"{_wiki_listing(candidates, doc_id)}"
+                ),
             },
         ],
         model=chat_model,

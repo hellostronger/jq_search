@@ -2,7 +2,27 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any
+
+# 网关侧的瞬时故障：限流与后端过载，退避后重试即可恢复；其余错误直接抛出
+_TRANSIENT = (
+    "rate limit",
+    "429",
+    "too many requests",
+    "overloaded",
+    "503",
+    "502",
+    "500",
+    "timeout",
+    "timed out",
+    "connection error",
+)
+
+
+def _is_transient(err: Exception) -> bool:
+    text = str(err).lower()
+    return any(k in text for k in _TRANSIENT)
 
 
 class LLMError(RuntimeError):
@@ -93,6 +113,19 @@ class LLM:
         return content
 
     def _request(self, kwargs: dict[str, Any]):
+        delay = 10.0
+        for attempt in range(1, 7):
+            try:
+                return self._create(kwargs)
+            except Exception as err:
+                if _is_transient(err) and attempt < 6:
+                    time.sleep(delay)
+                    delay = min(delay * 2, 180.0)
+                    continue
+                raise
+        raise LLMError("网关重试 6 次仍失败")  # 循环内必然 return 或 raise
+
+    def _create(self, kwargs: dict[str, Any]):
         try:
             return self._client.chat.completions.create(**kwargs)
         except Exception:
